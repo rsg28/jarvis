@@ -28,6 +28,14 @@ import webbrowser
 from datetime import datetime
 from pathlib import Path
 
+# Force UTF-8 on the console so accented team names / world news don't crash
+# the default cp1252 encoding on Windows shells.
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
+
 try:
     import tomllib  # Python 3.11+
 except ModuleNotFoundError:  # pragma: no cover

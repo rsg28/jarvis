@@ -1,13 +1,27 @@
 # Jarvis
 
-A tiny personal assistant I run in the morning. Boots with a spoken
-greeting, opens Spotify + Google, then waits for typed (or spoken)
-commands: `open code`, `play weeknd blinding lights`, `search rust cli
-crates`, `weather in Vancouver`, `what time is it`, `quit`.
+A small personal assistant I run in the morning. Boots with a spoken
+neural greeting, opens Spotify + Google, then waits for typed (or
+spoken) commands.
 
-It's a small, honest Jarvis — offline TTS via pyttsx3, no cloud
-dependencies for the core, and a regex-based intent table you can extend
-with one line per skill.
+Everything runs locally. No cloud accounts, no API keys — the neural
+voice uses Microsoft Edge's free `edge-tts` endpoint, news comes from
+Google News RSS, and live soccer scores come from ESPN's public JSON.
+
+## What it does
+
+| You say / type              | What happens                                             |
+|-----------------------------|----------------------------------------------------------|
+| `open spotify` / `open code`| Launches an app (desktop or web fallback)                |
+| `search <query>`            | Google search in your default browser                    |
+| `play <query>`              | Opens Spotify's web search                               |
+| `news` / `news tech`        | Reads top headlines aloud (world, tech, sports, …)       |
+| `scores`                    | Latest scores in your favorite league                    |
+| `scores premier` / `scores champions` / `scores peru` | Any league on demand           |
+| `weather in Vancouver`      | wttr.in one-liner (no API key)                           |
+| `what time is it` / `what day is it` | Reads the clock / date                          |
+| `help`                      | Prints the command list                                  |
+| `quit` / `exit`             | Signs off                                                |
 
 ## Install
 
@@ -18,69 +32,104 @@ pip install -r requirements.txt
 copy config.example.toml config.toml
 ```
 
-If you want microphone input, on Windows also run:
-
-```powershell
-pip install pipwin
-pipwin install pyaudio
-```
-
 ## Run
 
 ```powershell
-# boot routine + text loop
-python jarvis.py
-
-# skip the "good morning" boot
-python jarvis.py --no-greet
-
-# talk to it through the microphone
-python jarvis.py --voice
+python jarvis.py               # boot routine + text loop
+python jarvis.py --no-greet    # skip the "good morning"
+python jarvis.py --voice       # talk to it through the microphone
 ```
 
-## Commands
+Or **just double-click `launch.bat`** — it handles the venv and starts
+the assistant. Two Desktop shortcuts are provided (`Jarvis`, `Jarvis
+Voice`) if you drop them there.
 
-| You say / type              | What happens                                             |
-|-----------------------------|----------------------------------------------------------|
-| `open spotify`              | Launches Spotify (desktop or web fallback)               |
-| `open code`                 | Opens VS Code                                            |
-| `open <anything mapped>`    | Runs whatever the config maps that name to               |
-| `search rust cli crates`    | Google search in your default browser                    |
-| `play <query>`              | Opens Spotify's web search for the query                 |
-| `weather in Vancouver`      | wttr.in short summary (no API key needed)                |
-| `what time is it`           | Reads the clock                                          |
-| `what day is it`            | Reads today's date                                       |
-| `help`                      | Prints this command list                                 |
-| `quit` / `exit`             | Signs off and exits                                      |
+## Voice
+
+The default is `en-US-JennyNeural` (warm female US). Change it in
+`config.toml`:
+
+```toml
+[voice]
+engine     = "auto"                # "auto" | "edge" | "sapi"
+voice_name = "en-US-AriaNeural"    # neural voice for edge-tts
+rate       = 180
+volume     = 0.9
+```
+
+Popular neural voices:
+
+| Name                    | Style                                |
+|-------------------------|--------------------------------------|
+| `en-US-JennyNeural`     | Warm female US (default)             |
+| `en-US-AriaNeural`      | Crisp female US, news-anchor         |
+| `en-US-MichelleNeural`  | Younger female US                    |
+| `en-GB-SoniaNeural`     | Female UK                            |
+| `es-ES-ElviraNeural`    | Female Spain                         |
+| `es-MX-DaliaNeural`     | Female Mexico                        |
+| `fr-FR-DeniseNeural`    | Female France                        |
+
+Full list: `edge-tts --list-voices` (over 400 available).
+
+If `edge-tts` fails or is disabled, Jarvis falls back to Windows SAPI5
+(picks the first female voice it finds — usually Zira).
+
+## News
+
+Uses Google News RSS. Available topics: `world`, `tech`, `sports`,
+`business`, `science`, `health`, `entertainment`. Anything else is
+treated as a search phrase:
+
+```
+news                          → top world headlines
+news tech                     → technology section
+news about semiconductors     → free-form search
+what's happening in ai        → same, alternate phrasing
+```
+
+## Soccer
+
+Live scores + fixtures + finals via ESPN. Recognized league keywords:
+
+`la liga`, `premier` / `epl`, `champions` / `ucl`, `serie a`,
+`bundesliga`, `ligue 1`, `mls`, `peru` / `liga 1`, `libertadores`,
+`europa`, `world cup`.
+
+```
+scores                → your favorite league (from config)
+scores champions      → today's UCL fixtures / results
+scores peru           → Liga 1 Peruana
+who's playing today   → same as scores
+```
+
+Set your default in `config.toml`:
+
+```toml
+[soccer]
+favorite_league = "la liga"
+```
 
 ## Add a new skill
 
-Open `commands.py` and add one line to `INTENTS`:
+Drop one line into `INTENTS` in `commands.py`:
 
 ```python
 (r"^lock (my|the) (pc|screen)$",
- lambda d, m: d._open_app("terminal") ),  # or write your own handler
+ lambda d, m: d._open_app("terminal")),   # or write your own handler
 ```
 
-That's it. No boilerplate, no framework, one regex + one callable.
-
-## Config
-
-`config.toml` (copied from `config.example.toml`):
-
-* `user.name` — used in the morning greeting
-* `voice.rate`, `voice.volume` — TTS tuning
-* `startup.open_spotify`, `startup.open_google`, `startup.extra_urls` —
-  what boots with the assistant
-* `apps.<name>` — friendly aliases for launchable programs
+That's it. Regex + callable. No framework, no boilerplate.
 
 ## Files
 
 ```
 python-tools/jarvis/
-├── jarvis.py            main entry point + boot sequence
+├── jarvis.py            entry point + boot sequence
 ├── commands.py          intent table + dispatcher
-├── voice.py             pyttsx3 wrapper with graceful degradation
+├── voice.py             edge-tts (neural) → SAPI5 fallback
+├── news.py              Google News RSS
+├── soccer.py            ESPN scoreboard JSON
+├── launch.bat           one-click launcher for the Desktop shortcut
 ├── config.example.toml
 ├── requirements.txt
 ├── LICENSE (MIT)

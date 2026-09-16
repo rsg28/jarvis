@@ -97,16 +97,47 @@ class CommandDispatcher:
             return CommandResult(speak=f"I could not reach the weather service.",
                                  print_out="[jarvis] wttr.in unreachable")
 
+    def _news(self, match) -> CommandResult:
+        """Read the latest headlines. `news [topic|search phrase]`."""
+        import news as news_mod
+
+        topic = (match.groupdict().get("topic") or "world").strip()
+        limit = int(self.config.get("news", {}).get("limit", 5))
+        items = news_mod.headlines(topic, limit=limit)
+        if not items:
+            msg = f"No headlines available for {topic}."
+            return CommandResult(speak=msg, print_out=f"[jarvis] {msg}")
+
+        printable = [f"── Top {topic} headlines ──"] + [f"  {i+1}. {t}" for i, t in enumerate(items)]
+        # Read only the first 3 aloud to keep it snappy
+        spoken_bits = [t.split(" - ")[0] for t in items[:3]]
+        spoken = f"Here are the latest {topic} headlines. " + ". ".join(spoken_bits) + "."
+        return CommandResult(speak=spoken, print_out="\n".join(printable))
+
+    def _soccer(self, match) -> CommandResult:
+        """Live scores + fixtures. `scores [league|team]`."""
+        import soccer as soccer_mod
+
+        query = (match.groupdict().get("q") or "").strip()
+        if not query:
+            query = self.config.get("soccer", {}).get("favorite_league", "la liga")
+        slug, name = soccer_mod.resolve_league(query)
+        games = soccer_mod.scoreboard(slug)
+        spoken, printable = soccer_mod.format_scoreboard(games, name)
+        return CommandResult(speak=spoken, print_out=printable)
+
     def _help(self, _match) -> CommandResult:
         lines = [
             "Commands:",
-            "  open <app>            e.g. open spotify, open chrome, open code",
-            "  search <query>        opens Google search",
-            "  play <query>          searches Spotify",
-            "  what time is it       reads the clock",
-            "  what day is it        reads today's date",
-            "  weather [<location>]  quick summary via wttr.in",
-            "  quit / exit           bye",
+            "  open <app>              e.g. open spotify, open chrome, open code",
+            "  search <query>          opens Google search",
+            "  play <query>            searches Spotify",
+            "  news [<topic>]          world | tech | sports | business | science …",
+            "  scores [<league|team>]  la liga, premier, champions, mls, peru …",
+            "  what time is it         reads the clock",
+            "  what day is it          reads today's date",
+            "  weather [<location>]    quick summary via wttr.in",
+            "  quit / exit             bye",
         ]
         return CommandResult(print_out="\n".join(lines))
 
@@ -130,6 +161,19 @@ INTENTS: list[tuple[str, Callable[["CommandDispatcher", re.Match], CommandResult
 
     (r"^weather(?:\s+(?:in|at)\s+(?P<loc>.+))?$",
      lambda d, m: d._weather(m)),
+
+    # News: `news`, `news tech`, `news about ai`, `headlines`, `what's happening`
+    (r"^(?:news|headlines)(?:\s+(?:about\s+|on\s+)?(?P<topic>.+))?$",
+     lambda d, m: d._news(m)),
+    (r"^(?:what.?s\s+(?:new|happening)(?:\s+in\s+(?P<topic>.+))?)$",
+     lambda d, m: d._news(m)),
+
+    # Soccer / football scores: `scores`, `scores premier`, `soccer champions`,
+    # `football la liga`, `who is playing today`
+    (r"^(?:scores|score|soccer|football|fixtures|matches)(?:\s+(?P<q>.+))?$",
+     lambda d, m: d._soccer(m)),
+    (r"^who(?:'s| is)\s+playing(?:\s+in\s+(?P<q>.+))?(?:\s+today)?$",
+     lambda d, m: d._soccer(m)),
 
     (r"^open\s+(?P<app>.+)$",
      lambda d, m: d._open_app(m.group("app").strip())),

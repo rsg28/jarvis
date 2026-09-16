@@ -1,5 +1,15 @@
-pyttsx3>=2.90            # offline TTS (Windows SAPI5, macOS NSSpeech, eSpeak on Linux)
-SpeechRecognition>=3.10  # optional: --voice input
-# PyAudio is only needed for --voice; on Windows: pip install pipwin && pipwin install pyaudio
-pyaudio>=0.2.14; sys_platform != "win32"
+# Text-to-speech
+edge-tts>=6.1            # Microsoft Edge neural voices (free, no API key)
+pygame>=2.5              # audio playback for edge-tts output
+pyttsx3>=2.90            # fallback: offline SAPI5 / NSSpeech / eSpeak
+
+# Voice input (--voice flag)
+SpeechRecognition>=3.10
+pyaudio>=0.2.14
+
+# News + soccer skills
+feedparser>=6.0          # Google News RSS
+requests>=2.31           # ESPN scoreboard JSON
+
+# TOML config on Python 3.10 and older
 tomli>=2.0; python_version < "3.11"
