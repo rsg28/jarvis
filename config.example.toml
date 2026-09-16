@@ -1,0 +1,25 @@
+# Jarvis — copy this to config.toml and edit as you like.
+
+[user]
+name            = "Raul"
+greeting_style  = "morning"       # placeholder for future personalization
+
+[voice]
+enabled = true
+rate    = 180                     # words per minute (140-220 is comfortable)
+volume  = 0.9                     # 0.0 - 1.0
+
+[startup]
+open_spotify = true
+open_google  = true
+extra_urls   = []                 # e.g. ["https://calendar.google.com"]
+
+[apps]
+# Friendly name → what to launch. Edit paths per your machine.
+spotify    = "spotify"
+chrome     = "chrome"
+edge       = "msedge"
+code       = "code"
+notepad    = "notepad"
+calculator = "calc"
+terminal   = "wt"
