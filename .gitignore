@@ -3,3 +3,7 @@ config.toml
 __pycache__/
 *.pyc
 *.log
+
+# Local preview snapshots (throwaway)
+_hud/
+_prev/
