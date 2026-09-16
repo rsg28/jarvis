@@ -131,25 +131,71 @@ class WakeWordListener:
         return None
 
     def _capture_followup(self) -> None:
+        """Conversation loop — after a wake word, keep taking commands
+        without needing another 'hey jarvis' every time. The loop
+        exits on silence timeout, on explicit stop words, or on
+        `quit`/`exit` (dispatcher signals shutdown separately)."""
         sr = self._sr
-        try:
-            with self.mic as source:
-                audio = self.recognizer.listen(source, timeout=4.5, phrase_time_limit=8)
-        except sr.WaitTimeoutError:
-            print("[wake] no follow-up caught, going back to listening")
-            return
-        except Exception as exc:
-            logging.debug("follow-up listen error: %s", exc)
-            return
+        # Give the "yes, sir?" TTS a beat to actually start speaking so
+        # our pause_flag wait below traps it correctly.
+        time.sleep(0.15)
 
-        try:
-            text = self.recognizer.recognize_google(audio).strip()
-        except (sr.UnknownValueError, sr.RequestError):
-            return
-        except Exception as exc:
-            logging.debug("follow-up recognize error: %s", exc)
-            return
+        conversation_timeout = 12.0
+        silent_rounds = 0
+        MAX_SILENT_ROUNDS = 2
 
-        if text:
+        while not self._stop.is_set():
+            # Wait out any active TTS.
+            while self.pause_flag.is_set() and not self._stop.is_set():
+                time.sleep(0.1)
+
+            try:
+                with self.mic as source:
+                    audio = self.recognizer.listen(
+                        source,
+                        timeout=conversation_timeout,
+                        phrase_time_limit=10,
+                    )
+            except sr.WaitTimeoutError:
+                print("[wake] conversation timed out, going back to wake mode")
+                return
+            except Exception as exc:
+                logging.debug("conversation listen error: %s", exc)
+                return
+
+            # If Jarvis started speaking mid-listen, discard this chunk.
+            if self.pause_flag.is_set():
+                continue
+
+            try:
+                text = self.recognizer.recognize_google(audio).strip()
+            except sr.UnknownValueError:
+                silent_rounds += 1
+                if silent_rounds >= MAX_SILENT_ROUNDS:
+                    print("[wake] too many empty rounds, back to wake mode")
+                    return
+                continue
+            except sr.RequestError as exc:
+                logging.warning("Google STT unreachable: %s", exc)
+                time.sleep(1.0)
+                continue
+            except Exception as exc:
+                logging.debug("conversation recognize error: %s", exc)
+                continue
+
+            if not text:
+                continue
+            silent_rounds = 0
+
+            # Soft stop — user asked to end the chat without shutting Jarvis down.
+            if re.search(
+                r"\b(stop listening|go to sleep|never ?mind|forget it|shut up)\b",
+                text, re.I,
+            ):
+                print(f"[wake] user asked to stop: {text!r}")
+                # Fire a synthetic response so the HUD echoes and speaks it.
+                self.on_command("__stop_listening__")
+                return
+
             print(f"[wake] command → {text!r}")
             self.on_command(text)

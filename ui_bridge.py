@@ -18,6 +18,10 @@ class JarvisBridge(QObject):
     # Emitted when the user right-clicks Close on the HUD.
     quit_requested = Signal()
 
+    # Emitted when a command needs the UI to do something (e.g. "help" pops
+    # open the command panel). Payload is a short action key.
+    ui_action = Signal(str)
+
     def set_state(self, state: str) -> None:
         self.state_changed.emit(state)
 

@@ -316,10 +316,25 @@ def run_ui_loop(config: dict, voice: Voice) -> int:
             if text == "__EXIT__":
                 return
             result = dispatcher.dispatch(text)
+
+            # UI-facing side-effects go out on the bridge first so the panel
+            # appears before Jarvis starts speaking.
+            if result.ui_action:
+                bridge.ui_action.emit(result.ui_action)
+
+            spoke = False
             if result.speak:
-                guarded.say(result.speak)
+                guarded.say(result.speak)   # transitions state → speaking → idle
+                spoke = True
             if result.print_out:
                 print(result.print_out)
+
+            # Failsafe: if the handler returned nothing spoken and nothing
+            # else brought the state back down, force idle so the HUD
+            # doesn't get stuck in "thinking" forever.
+            if not spoke and not result.should_exit:
+                bridge.set_state("idle")
+
             if result.should_exit:
                 bridge.quit_requested.emit()
                 return

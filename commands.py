@@ -21,6 +21,8 @@ class CommandResult:
     speak: Optional[str] = None
     print_out: Optional[str] = None
     should_exit: bool = False
+    # Optional signal to the HUD process ("help" opens the command panel).
+    ui_action: Optional[str] = None
 
 
 class CommandDispatcher:
@@ -284,6 +286,8 @@ class CommandDispatcher:
 
     # ────────────── help / quit ──────────────
     def _help(self, _match) -> CommandResult:
+        # In UI mode this pops open a stylised help panel next to the orb.
+        # In text/wake mode the same lines print to stdout via `print_out`.
         lines = [
             "Commands:",
             "  open <app>              e.g. open spotify, open chrome, open code",
@@ -304,18 +308,31 @@ class CommandDispatcher:
             "  cancel timers           cancel all",
             "  joke | trivia",
             "  speak spanish | speak english | speak french | speak british",
-            "  quit / exit             bye",
+            "  stop listening          end the conversation, back to wake mode",
+            "  quit / exit             shut Jarvis down",
         ]
-        return CommandResult(print_out="\n".join(lines))
+        return CommandResult(
+            speak="Opening the command panel, sir.",
+            print_out="\n".join(lines),
+            ui_action="help",
+        )
 
     def _quit(self, _match) -> CommandResult:
         return CommandResult(speak="Signing off. Have a productive day.",
                              print_out="[jarvis] goodbye", should_exit=True)
 
+    def _stop_listening(self, _match) -> CommandResult:
+        # Soft stop — end the current conversation, stay resident, wait
+        # for another wake word. Wake listener already returned by the
+        # time this fires; we just need a spoken acknowledgement.
+        return CommandResult(speak="Standing by, sir. Just say 'hey jarvis' when you need me.")
+
 
 # ────────────── intent table ──────────────
 # Order matters: the first match wins.
 INTENTS: list[tuple[str, Callable[["CommandDispatcher", re.Match], CommandResult]]] = [
+    (r"^__stop_listening__$",
+     lambda d, m: d._stop_listening(m)),
     (r"^(help|what can you do|commands)$",
      lambda d, m: d._help(m)),
     (r"^(quit|exit|bye|goodbye|shutdown)$",
