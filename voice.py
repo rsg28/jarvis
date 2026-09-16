@@ -36,12 +36,14 @@ class Voice:
         volume: float = 0.9,
         engine: str = "auto",
         voice_name: Optional[str] = None,
+        address: str = "",
     ) -> None:
         self.enabled = enabled
         self.rate = rate
         self.volume = max(0.0, min(1.0, float(volume)))
         self.engine = engine  # "auto" | "edge" | "sapi"
         self.voice_name = voice_name
+        self.address = (address or "").strip()
         self._edge_ready = False
         self._sapi = None
 
@@ -60,6 +62,24 @@ class Voice:
         old = self.voice_name
         self.voice_name = voice_name
         return f"voice: {old} → {voice_name}"
+
+    # ────────────── addressing (sir / madam / …) ──────────────
+    def _sirify(self, text: str) -> str:
+        """Append the configured address to spoken lines, naturally."""
+        addr = self.address
+        if not addr or not text:
+            return text
+        lowered = text.lower()
+        needle = addr.lower()
+        # Already contains the address — leave alone.
+        if f", {needle}" in lowered or f" {needle}." in lowered or lowered.endswith(f" {needle}"):
+            return text
+        stripped = text.rstrip()
+        if not stripped:
+            return text
+        if stripped[-1] in ".!?":
+            return stripped[:-1] + f", {addr}" + stripped[-1]
+        return stripped + f", {addr}."
 
     # ────────────── engine setup ──────────────
     def _init_edge(self) -> bool:
@@ -103,6 +123,7 @@ class Voice:
 
         # Trim excess whitespace but keep punctuation for natural prosody.
         text = " ".join(text.split())
+        text = self._sirify(text)
         print(f"jarvis \u203a {text}")
 
         if self._edge_ready:

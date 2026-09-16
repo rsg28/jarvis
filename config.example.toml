@@ -2,6 +2,8 @@
 
 [user]
 name            = "Raul"
+address         = "sir"           # how Jarvis addresses you. Try "sir",
+                                  # "madam", "boss", or "" to disable.
 greeting_style  = "morning"       # placeholder for future personalization
 
 [voice]

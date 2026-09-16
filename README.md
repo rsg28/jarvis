@@ -58,6 +58,62 @@ the assistant. Three Desktop shortcuts are provided:
 * **Jarvis Voice** — one-shot mic input per turn
 * **Jarvis Always Listening** — hands-free wake-word mode
 
+## Clap to launch
+
+Even better than a wake word: **two quick claps** anywhere in the
+room will launch Jarvis in wake-word mode. No terminal, no shortcut,
+no keyboard — from Jarvis being closed to fully listening in about a
+second.
+
+Install the auto-start:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File install_startup.ps1
+```
+
+That drops a shortcut into your Windows Startup folder pointing at
+`clap_watcher.vbs`, which runs `clap_watcher.py` silently via
+`pythonw.exe` (no console window). It stays running across logins.
+
+The detector demands two amplitude spikes 150 ms - 1200 ms apart, each
+above the configured threshold, with quiet in between — enough to
+reject speech, TV, keyboard clatter, and door slams. A three-second
+cooldown after firing prevents echo re-triggers.
+
+Tuning knobs:
+
+```powershell
+python clap_watcher.py --threshold 0.28    # more sensitive
+python clap_watcher.py --threshold 0.45    # less sensitive
+python clap_watcher.py --dry-run           # detect and log, don't launch
+python clap_watcher.py --list-devices      # if you have multiple mics
+```
+
+To remove the auto-start:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File install_startup.ps1 -Uninstall
+```
+
+Concurrent launches are prevented by a PID lock file
+(`%TEMP%\jarvis.lock`); if Jarvis is already listening, extra claps are
+ignored.
+
+## Personality — how Jarvis addresses you
+
+By default Jarvis speaks to you as `sir` (Iron Man style). Change it
+in `config.toml`:
+
+```toml
+[user]
+name    = "Raul"
+address = "sir"     # try "sir", "madam", "boss", or "" to disable
+```
+
+The address is appended naturally to every spoken response — *"Timer
+complete, sir."*, *"Volume set to 40 percent, sir."*, *"Signing off.
+Have a productive day, sir."*
+
 ## Wake word
 
 In wake mode Jarvis quietly listens for `hey jarvis` (or `jarvis`)
@@ -169,6 +225,9 @@ python-tools/jarvis/
 ├── fun.py               jokes (JokeAPI) + trivia (OpenTDB)
 ├── scheduler.py         timers, pomodoros, reminders (threaded)
 ├── wake.py              background wake-word listener ("hey jarvis")
+├── clap_watcher.py      standalone service: 2 claps -> launch Jarvis
+├── clap_watcher.vbs     silent (no console) launcher for the watcher
+├── install_startup.ps1  add/remove Windows Startup shortcut for clap watcher
 ├── launch.bat           one-click launcher for the Desktop shortcut
 ├── config.example.toml
 ├── requirements.txt

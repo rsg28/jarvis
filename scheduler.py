@@ -62,11 +62,11 @@ class Scheduler:
             return
 
         if job.kind == "pomodoro":
-            self.notify(f"Pomodoro finished. Take a five minute break, Raul.")
+            self.notify("Pomodoro complete. Time for a five minute break.")
         elif job.kind == "reminder":
-            self.notify(f"Reminder: {job.label}")
+            self.notify(f"As requested: {job.label}")
         else:
-            self.notify(f"Timer done: {job.label or 'time is up'}.")
+            self.notify(f"Timer complete. {job.label or 'time is up'}.")
 
     def cancel(self, job_id: int) -> bool:
         job = self._jobs.get(job_id)

@@ -20,15 +20,20 @@ Config:  copy config.example.toml to config.toml and edit your name + apps.
 from __future__ import annotations
 
 import argparse
+import atexit
 import logging
+import os
 import platform
 import queue
 import sys
+import tempfile
 import threading
 import time
 import webbrowser
 from datetime import datetime
 from pathlib import Path
+
+LOCK_PATH = Path(tempfile.gettempdir()) / "jarvis.lock"
 
 # Force UTF-8 on the console so accented team names / world news don't crash
 # the default cp1252 encoding on Windows shells.
@@ -50,7 +55,7 @@ from voice import Voice
 # ─────────────────────── config ───────────────────────
 
 DEFAULT_CONFIG = {
-    "user": {"name": "Raul", "greeting_style": "morning"},
+    "user": {"name": "Raul", "greeting_style": "morning", "address": "sir"},
     "voice": {"enabled": True, "rate": 180, "volume": 0.9},
     "startup": {
         "open_spotify": True,
@@ -86,24 +91,42 @@ def load_config(path: Path) -> dict:
 
 # ─────────────────────── boot sequence ───────────────────────
 
-def morning_greeting(voice: Voice, name: str) -> str:
+def _write_lock() -> None:
+    """Persist our PID so external tools (e.g. clap_watcher) don't relaunch us."""
+    try:
+        LOCK_PATH.write_text(str(os.getpid()), encoding="utf-8")
+        atexit.register(_release_lock)
+    except OSError as exc:
+        logging.debug("could not write lock file: %s", exc)
+
+
+def _release_lock() -> None:
+    try:
+        if LOCK_PATH.exists() and LOCK_PATH.read_text().strip() == str(os.getpid()):
+            LOCK_PATH.unlink()
+    except OSError:
+        pass
+
+
+def morning_greeting(voice: Voice, name: str, address: str) -> str:
     hour = datetime.now().hour
     if hour < 12:
-        greet = f"Good morning, {name}"
+        greet = f"Good morning, {address}" if address else f"Good morning, {name}"
     elif hour < 18:
-        greet = f"Good afternoon, {name}"
+        greet = f"Good afternoon, {address}" if address else f"Good afternoon, {name}"
     else:
-        greet = f"Good evening, {name}"
+        greet = f"Good evening, {address}" if address else f"Good evening, {name}"
     now = datetime.now().strftime("%A, %B %d — %I:%M %p")
-    line = f"{greet}. It is {now}. Ready when you are."
+    line = f"{greet}. It is {now}. At your service."
     voice.say(line)
     return line
 
 
 def boot(config: dict, voice: Voice) -> None:
     name = config["user"]["name"]
+    address = config["user"].get("address", "")
     print("\n=== JARVIS · online ===")
-    morning_greeting(voice, name)
+    morning_greeting(voice, name, address)
 
     startup = config["startup"]
     if startup.get("open_spotify", True):
@@ -194,6 +217,7 @@ def _read_voice(listener) -> str:
 
 def run_text_or_oneshot(config: dict, voice: Voice, use_voice: bool) -> int:
     dispatcher = CommandDispatcher(config=config, voice=voice)
+    address = config["user"].get("address", "")
 
     listener = None
     if use_voice:
@@ -206,7 +230,7 @@ def run_text_or_oneshot(config: dict, voice: Voice, use_voice: bool) -> int:
         try:
             command = _read_voice(listener) if use_voice else _read_text()
         except (KeyboardInterrupt, EOFError):
-            voice.say("Signing off. Have a good one.")
+            voice.say("Signing off. Have a productive day.")
             return 0
 
         if not command:
@@ -228,12 +252,14 @@ def run_wake_loop(config: dict, voice: Voice) -> int:
     pause = threading.Event()
     guarded = GuardedVoice(voice, pause)
     dispatcher = CommandDispatcher(config=config, voice=guarded)
+    address = config["user"].get("address", "")
 
     cmd_queue: "queue.Queue[str]" = queue.Queue()
 
     wake_cfg = config.get("wake", {})
     phrases = wake_cfg.get("phrases", ["hey jarvis", "jarvis"])
-    ack = wake_cfg.get("ack", "Yes?")
+    default_ack = f"Yes, {address}?" if address else "Yes?"
+    ack = wake_cfg.get("ack", default_ack)
 
     def _on_wake() -> None:
         guarded.say(ack)
@@ -274,7 +300,7 @@ def run_wake_loop(config: dict, voice: Voice) -> int:
         try:
             text = cmd_queue.get()
         except KeyboardInterrupt:
-            guarded.say("Signing off. Have a good one.")
+            guarded.say("Signing off. Have a productive day.")
             listener.stop()
             return 0
 
@@ -304,6 +330,7 @@ def main() -> int:
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    _write_lock()
     config = load_config(args.config)
     voice = Voice(
         enabled=config["voice"].get("enabled", True),
@@ -311,6 +338,7 @@ def main() -> int:
         volume=config["voice"].get("volume", 0.9),
         engine=config["voice"].get("engine", "auto"),
         voice_name=config["voice"].get("voice_name"),
+        address=config["user"].get("address", ""),
     )
 
     if not args.no_greet:

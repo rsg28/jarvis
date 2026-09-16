@@ -309,7 +309,7 @@ class CommandDispatcher:
         return CommandResult(print_out="\n".join(lines))
 
     def _quit(self, _match) -> CommandResult:
-        return CommandResult(speak="Signing off. Have a good one.",
+        return CommandResult(speak="Signing off. Have a productive day.",
                              print_out="[jarvis] goodbye", should_exit=True)
 
 
