@@ -187,10 +187,11 @@ def launch_jarvis(dry_run: bool = False) -> None:
     if sys.platform == "win32":
         creationflags = 0x00000008 | 0x00000200  # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
 
-    # --voice: after the clap boot, Jarvis listens for a command directly
-    # (no "hey jarvis" prefix needed — the clap was your wake signal).
+    # --wake: the clap boots Jarvis into always-listening mode. From then on
+    # you say "hey jarvis <command>" and he answers. No need to clap again
+    # unless he has been fully closed.
     subprocess.Popen(
-        ["cmd.exe", "/c", "start", "", str(bat), "--voice"],
+        ["cmd.exe", "/c", "start", "", str(bat), "--wake"],
         cwd=str(HERE),
         creationflags=creationflags,
     )
