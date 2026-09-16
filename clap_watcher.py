@@ -89,6 +89,12 @@ class ClapDetector:
         if now < self.cool_until:
             return False
 
+        # Cooldown just expired — reset the state so future claps are heard.
+        if self.state == "cool":
+            _log("cooldown expired, resetting state to idle")
+            self.state = "idle"
+            self.first_clap_at = 0.0
+
         is_spike = peak >= self.threshold and rms < self.noise_floor * 6
 
         # Also ignore very rapid re-fires from the same clap tail
