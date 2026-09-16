@@ -47,12 +47,38 @@ copy config.example.toml config.toml
 ```powershell
 python jarvis.py               # boot routine + text loop
 python jarvis.py --no-greet    # skip the "good morning"
-python jarvis.py --voice       # talk to it through the microphone
+python jarvis.py --voice       # one-shot microphone input
+python jarvis.py --wake        # always-listening ("hey jarvis")
 ```
 
 Or **just double-click `launch.bat`** — it handles the venv and starts
-the assistant. Two Desktop shortcuts are provided (`Jarvis`, `Jarvis
-Voice`) if you drop them there.
+the assistant. Three Desktop shortcuts are provided:
+
+* **Jarvis** — text mode with morning boot
+* **Jarvis Voice** — one-shot mic input per turn
+* **Jarvis Always Listening** — hands-free wake-word mode
+
+## Wake word
+
+In wake mode Jarvis quietly listens for `hey jarvis` (or `jarvis`)
+in the background. When it hears you it says `Yes?` and captures the
+next thing you say as a command. You can also chain the wake and
+command in one breath — *"hey jarvis, play blinding lights"* dispatches
+immediately, no follow-up needed.
+
+Customise in `config.toml`:
+
+```toml
+[wake]
+enabled = false                 # or true to always launch in wake mode
+phrases = ["hey jarvis", "jarvis", "computer"]
+ack     = "Yes?"
+```
+
+Typed commands still work while wake mode is active — anything you
+type into the terminal gets dispatched the same way as a spoken
+command. While Jarvis is speaking, the listener is automatically
+paused so it doesn't hear itself.
 
 ## Voice
 
@@ -142,6 +168,7 @@ python-tools/jarvis/
 ├── system.py            battery, cpu, ram, disk, ip, wifi, volume, media keys, screenshot
 ├── fun.py               jokes (JokeAPI) + trivia (OpenTDB)
 ├── scheduler.py         timers, pomodoros, reminders (threaded)
+├── wake.py              background wake-word listener ("hey jarvis")
 ├── launch.bat           one-click launcher for the Desktop shortcut
 ├── config.example.toml
 ├── requirements.txt

@@ -24,6 +24,11 @@ open_spotify = true
 open_google  = true
 extra_urls   = []                 # e.g. ["https://calendar.google.com"]
 
+[wake]
+enabled = false                   # set true to always run in wake-word mode
+phrases = ["hey jarvis", "jarvis"]
+ack     = "Yes?"                  # what Jarvis says when it hears you
+
 [news]
 limit = 5                         # how many headlines to fetch per call
 
