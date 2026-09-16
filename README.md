@@ -49,14 +49,43 @@ python jarvis.py               # boot routine + text loop
 python jarvis.py --no-greet    # skip the "good morning"
 python jarvis.py --voice       # one-shot microphone input
 python jarvis.py --wake        # always-listening ("hey jarvis")
+python jarvis.py --ui          # always-listening + floating orb HUD
 ```
 
 Or **just double-click `launch.bat`** — it handles the venv and starts
-the assistant. Three Desktop shortcuts are provided:
+the assistant. Four Desktop shortcuts are provided:
 
 * **Jarvis** — text mode with morning boot
 * **Jarvis Voice** — one-shot mic input per turn
 * **Jarvis Always Listening** — hands-free wake-word mode
+* **Jarvis HUD** — floating orb overlay, no terminal (launches `launch_ui.vbs`)
+
+## HUD — the floating orb
+
+`--ui` mode replaces the terminal with a **frameless, always-on-top,
+translucent circular orb** docked at the right edge of your primary
+screen. It reacts to Jarvis's state in real time:
+
+| State       | Look                                                     |
+|-------------|----------------------------------------------------------|
+| Idle        | Dark navy orb, faint cyan halo, slow breathing pulse     |
+| Listening   | Bright cyan glow + expanding sonar rings                 |
+| Thinking    | Amber orb with a spinning conic-gradient loader          |
+| Speaking    | Magenta orb with concentric rings pulsing on each phrase |
+
+The orb is drag-to-move (left-click and hold), right-click for a menu
+(reset position, toggle always-on-top, quit). A chip beneath the orb
+shows the current state (`STANDBY` / `LISTENING` / `THINKING` /
+`SPEAKING`); a smaller chip below that echoes the last thing you said
+and Jarvis's reply — so you can glance at the screen instead of having
+to catch every word.
+
+Under the hood the HUD is a `QWidget` painted from scratch with
+`QPainter` (radial gradients, conic gradients, rotating dashed arcs),
+running on the Qt main thread. Background threads (wake listener,
+voice engine) push state updates through a `JarvisBridge` `QObject`
+using thread-safe queued signals — see `jarvis_ui.py` and
+`ui_bridge.py`.
 
 ## Clap to launch
 

@@ -245,6 +245,96 @@ def run_text_or_oneshot(config: dict, voice: Voice, use_voice: bool) -> int:
             return 0
 
 
+def run_ui_loop(config: dict, voice: Voice) -> int:
+    """Wake-word loop with a floating orb HUD. Blocks on the Qt event loop."""
+    from PySide6.QtWidgets import QApplication
+
+    from ui_bridge import JarvisBridge
+    from jarvis_ui import run_hud
+    from wake import WakeWordListener
+
+    app = QApplication.instance() or QApplication(sys.argv)
+    app.setQuitOnLastWindowClosed(True)
+
+    bridge = JarvisBridge()
+
+    # Guard so the wake listener silences itself while Jarvis is speaking.
+    listener_pause = threading.Event()
+
+    class GuardedUIVoice:
+        def __init__(self, inner: Voice) -> None:
+            self._inner = inner
+
+        def say(self, text: str) -> None:
+            bridge.push_jarvis(text)
+            bridge.set_state("speaking")
+            listener_pause.set()
+            try:
+                self._inner.say(text)
+                time.sleep(0.25)
+            finally:
+                listener_pause.clear()
+                bridge.set_state("idle")
+
+        def set_voice(self, name: str) -> str:
+            return self._inner.set_voice(name)
+
+    guarded = GuardedUIVoice(voice)
+    dispatcher = CommandDispatcher(config=config, voice=guarded)
+
+    cmd_queue: "queue.Queue[str]" = queue.Queue()
+
+    wake_cfg = config.get("wake", {})
+    phrases = wake_cfg.get("phrases", ["hey jarvis", "jarvis"])
+    address = config["user"].get("address", "")
+    default_ack = f"Yes, {address}?" if address else "Yes?"
+    ack = wake_cfg.get("ack", default_ack)
+
+    def _on_wake() -> None:
+        bridge.set_state("listening")
+        guarded.say(ack)
+
+    def _on_command(text: str) -> None:
+        bridge.push_you(text)
+        bridge.set_state("processing")
+        cmd_queue.put(text)
+
+    # Wake listener on its own daemon thread (unchanged from run_wake_loop).
+    listener = WakeWordListener(
+        wake_phrases=phrases,
+        on_command=_on_command,
+        on_wake=_on_wake,
+        pause_flag=listener_pause,
+    )
+    listener.start()
+
+    # Command dispatcher runs on a daemon thread so the Qt event loop stays
+    # responsive. Voice.say() is synchronous but that's fine on this thread.
+    def _dispatch_pump() -> None:
+        while True:
+            text = cmd_queue.get()
+            if text == "__EXIT__":
+                return
+            result = dispatcher.dispatch(text)
+            if result.speak:
+                guarded.say(result.speak)
+            if result.print_out:
+                print(result.print_out)
+            if result.should_exit:
+                bridge.quit_requested.emit()
+                return
+
+    threading.Thread(target=_dispatch_pump, daemon=True).start()
+
+    # Boot greeting on startup (unless suppressed elsewhere).
+    bridge.set_state("idle")
+
+    ret = run_hud(bridge)
+    listener.stop()
+    cmd_queue.put("__EXIT__")
+    return ret
+
+
 def run_wake_loop(config: dict, voice: Voice) -> int:
     """Always-on wake-word mode. Also accepts typed commands in parallel."""
     from wake import WakeWordListener
@@ -327,6 +417,8 @@ def main() -> int:
     parser.add_argument("--voice", action="store_true", help="One-shot microphone input")
     parser.add_argument("--wake",  action="store_true",
                         help="Always-listening wake-word mode ('hey jarvis')")
+    parser.add_argument("--ui",    action="store_true",
+                        help="Wake mode with a floating orb HUD")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -346,6 +438,10 @@ def main() -> int:
 
     # Config-driven default: `[wake].enabled = true` also triggers wake mode.
     wake_mode = args.wake or config.get("wake", {}).get("enabled", False)
+    ui_mode = args.ui or config.get("ui", {}).get("enabled", False)
+
+    if ui_mode:
+        return run_ui_loop(config, voice)
 
     if wake_mode:
         return run_wake_loop(config, voice)

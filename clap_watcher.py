@@ -1,5 +1,5 @@
-"""
-Clap Watcher — a tiny background service that launches Jarvis when it
+﻿"""
+Clap Watcher â€” a tiny background service that launches Jarvis when it
 hears two claps in quick succession.
 
 How it works
@@ -8,14 +8,14 @@ A clap has three defining properties: a fast attack, a peak that clears
 a loud threshold, and a very short decay. This script streams the
 microphone through sounddevice, computes a short-time RMS + peak for
 each block, and looks for two spike-shaped events whose peaks are
-separated by 150 ms to 1200 ms — the natural cadence of a double clap.
+separated by 150 ms to 1200 ms â€” the natural cadence of a double clap.
 
 To avoid false positives from speech and sustained noise the detector
 demands:
 
-    · peak above `--threshold`   (default 0.35 in float32)
-    · block RMS below `--noise-floor` between claps
-    · a 3 second cooldown after firing
+    Â· peak above `--threshold`   (default 0.35 in float32)
+    Â· block RMS below `--noise-floor` between claps
+    Â· a 3 second cooldown after firing
 
 When two claps are detected the script spawns Jarvis by running
 `launch.bat --wake`. If Jarvis is already running (detected via a lock
@@ -60,7 +60,7 @@ def _log(msg: str) -> None:
         pass
 
 
-# ─────────────────────── clap state machine ───────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ clap state machine â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 class ClapDetector:
     """Detects double claps in a streaming audio callback."""
@@ -89,7 +89,7 @@ class ClapDetector:
         if now < self.cool_until:
             return False
 
-        # Cooldown just expired — reset the state so future claps are heard.
+        # Cooldown just expired â€” reset the state so future claps are heard.
         if self.state == "cool":
             _log("cooldown expired, resetting state to idle")
             self.state = "idle"
@@ -117,7 +117,7 @@ class ClapDetector:
                     return True
                 else:
                     _log(f"spike rejected: gap={gap*1000:.0f} ms outside [{self.min_gap*1000:.0f}, {self.max_gap*1000:.0f}]")
-                    # Too fast or too slow — treat this as the new first clap
+                    # Too fast or too slow â€” treat this as the new first clap
                     self.first_clap_at = now
         else:
             # If we've been waiting too long for the second clap, reset.
@@ -127,7 +127,7 @@ class ClapDetector:
         return False
 
 
-# ─────────────────────── launcher ───────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ launcher â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def _jarvis_is_running() -> bool:
     if not LOCK_PATH.exists():
@@ -172,24 +172,25 @@ def launch_jarvis(dry_run: bool = False) -> None:
         print(f"[clap] Jarvis already running (pid in {LOCK_PATH.name}); ignoring double clap")
         return
     _log("launching Jarvis (launch.bat --voice)")
-    print("[clap] double clap detected — launching Jarvis")
+    print("[clap] double clap detected â€” launching Jarvis")
     if dry_run:
         return
 
-    bat = HERE / "launch.bat"
-    if not bat.exists():
-        print(f"[clap] launch.bat not found at {bat}", file=sys.stderr)
+    # Preferred: launch_ui.vbs runs jarvis.py --ui via pythonw so NO
+    # terminal window ever appears. The experience is HUD-only.
+    vbs = HERE / "launch_ui.vbs"
+    if vbs.exists():
+        subprocess.Popen(["wscript.exe", str(vbs)], cwd=str(HERE))
         return
 
-    # `start` with a fresh window so the watcher's own console (if any) stays.
-    # DETACHED_PROCESS + CREATE_NEW_PROCESS_GROUP so it survives when we exit.
+    # Fallback: legacy .bat launcher with a console window.
+    bat = HERE / "launch.bat"
+    if not bat.exists():
+        print(f"[clap] no launcher found in {HERE}", file=sys.stderr)
+        return
     creationflags = 0
     if sys.platform == "win32":
         creationflags = 0x00000008 | 0x00000200  # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
-
-    # --wake: the clap boots Jarvis into always-listening mode. From then on
-    # you say "hey jarvis <command>" and he answers. No need to clap again
-    # unless he has been fully closed.
     subprocess.Popen(
         ["cmd.exe", "/c", "start", "", str(bat), "--wake"],
         cwd=str(HERE),
@@ -197,7 +198,7 @@ def launch_jarvis(dry_run: bool = False) -> None:
     )
 
 
-# ─────────────────────── main loop ───────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ main loop â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def run(
     threshold: float,
@@ -213,7 +214,7 @@ def run(
     print(f"[clap] listening on device {device if device is not None else 'default'}")
     print(f"[clap] threshold={threshold:.2f}  noise_floor={noise_floor:.2f}")
     print(f"[clap] log: {LOG_PATH}")
-    print("[clap] two quick claps → launch Jarvis. Ctrl+C to stop.")
+    print("[clap] two quick claps â†’ launch Jarvis. Ctrl+C to stop.")
     _log(f"startup: threshold={threshold} noise_floor={noise_floor} device={device}")
 
     def callback(indata, frames, time_info, status):
@@ -270,3 +271,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
