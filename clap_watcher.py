@@ -1,5 +1,5 @@
-﻿"""
-Clap Watcher â€” a tiny background service that launches Jarvis when it
+"""
+Clap Watcher -- a tiny background service that launches Jarvis when it
 hears two claps in quick succession.
 
 How it works
@@ -8,22 +8,28 @@ A clap has three defining properties: a fast attack, a peak that clears
 a loud threshold, and a very short decay. This script streams the
 microphone through sounddevice, computes a short-time RMS + peak for
 each block, and looks for two spike-shaped events whose peaks are
-separated by 150 ms to 1200 ms â€” the natural cadence of a double clap.
+separated by 150 ms to 1200 ms -- the natural cadence of a double clap.
 
 To avoid false positives from speech and sustained noise the detector
 demands:
 
-    Â· peak above `--threshold`   (default 0.35 in float32)
-    Â· block RMS below `--noise-floor` between claps
-    Â· a 3 second cooldown after firing
+    - peak above `--threshold`   (default 0.22 in float32)
+    - block RMS below `--noise-floor` between claps
+    - a 3 second cooldown after firing
 
-When two claps are detected the script spawns Jarvis by running
-`launch.bat --wake`. If Jarvis is already running (detected via a lock
-file in the user's temp dir) the trigger is ignored.
+By default the watcher runs in **one-shot** mode: the first successful
+double clap launches Jarvis via `launch_ui.vbs` (silent HUD mode) and
+then the watcher exits. From that point on the "hey jarvis" wake word
+inside Jarvis handles all further commands. On next boot the Startup
+folder re-arms the watcher automatically.
+
+Pass `--continuous` to keep listening and relaunch Jarvis on every
+double clap (useful for testing).
 
 Usage
 -----
-    python clap_watcher.py                        # default settings
+    python clap_watcher.py                        # default: one-shot
+    python clap_watcher.py --continuous           # keep firing forever
     python clap_watcher.py --threshold 0.28       # more sensitive
     python clap_watcher.py --dry-run              # print only, don't launch
 
@@ -37,6 +43,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
@@ -48,6 +55,11 @@ import sounddevice as sd
 HERE = Path(__file__).resolve().parent
 LOCK_PATH = Path(tempfile.gettempdir()) / "jarvis.lock"
 LOG_PATH  = Path(tempfile.gettempdir()) / "jarvis-clap.log"
+
+# One-shot mode: after the very first successful double-clap launches
+# Jarvis, the watcher stops listening. From that point on the user talks
+# to Jarvis with the "hey jarvis" wake word. Next reboot re-arms clap.
+_stop_event = threading.Event()
 
 
 def _log(msg: str) -> None:
@@ -166,36 +178,61 @@ def _clean_stale_lock(reason: str) -> None:
         pass
 
 
-def launch_jarvis(dry_run: bool = False) -> None:
+def launch_jarvis(dry_run: bool = False, one_shot: bool = True) -> None:
     if _jarvis_is_running():
         _log("launch skipped: Jarvis already running")
         print(f"[clap] Jarvis already running (pid in {LOCK_PATH.name}); ignoring double clap")
+        # Still one-shot even if Jarvis was already up: hand control over
+        # to the wake word.
+        if one_shot:
+            _stop_event.set()
         return
-    _log("launching Jarvis (launch.bat --voice)")
-    print("[clap] double clap detected â€” launching Jarvis")
+
+    _log("launching Jarvis via launch_ui.vbs (--ui, silent)")
+    print("[clap] double clap detected -- launching Jarvis")
+
     if dry_run:
+        if one_shot:
+            _stop_event.set()
         return
 
     # Preferred: launch_ui.vbs runs jarvis.py --ui via pythonw so NO
     # terminal window ever appears. The experience is HUD-only.
     vbs = HERE / "launch_ui.vbs"
+    launched = False
     if vbs.exists():
-        subprocess.Popen(["wscript.exe", str(vbs)], cwd=str(HERE))
-        return
+        try:
+            subprocess.Popen(
+                ["wscript.exe", str(vbs)],
+                cwd=str(HERE),
+                creationflags=(0x08000000 if sys.platform == "win32" else 0),  # CREATE_NO_WINDOW
+            )
+            launched = True
+        except OSError as exc:
+            _log(f"launch_ui.vbs failed: {exc}")
 
-    # Fallback: legacy .bat launcher with a console window.
-    bat = HERE / "launch.bat"
-    if not bat.exists():
-        print(f"[clap] no launcher found in {HERE}", file=sys.stderr)
-        return
-    creationflags = 0
-    if sys.platform == "win32":
-        creationflags = 0x00000008 | 0x00000200  # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
-    subprocess.Popen(
-        ["cmd.exe", "/c", "start", "", str(bat), "--wake"],
-        cwd=str(HERE),
-        creationflags=creationflags,
-    )
+    # Fallback: pythonw.exe directly, still without a console window.
+    if not launched:
+        pythonw = HERE / ".venv" / "Scripts" / "pythonw.exe"
+        if not pythonw.exists():
+            pythonw = Path("pythonw.exe")
+        jarvis_py = HERE / "jarvis.py"
+        try:
+            subprocess.Popen(
+                [str(pythonw), str(jarvis_py), "--ui"],
+                cwd=str(HERE),
+                creationflags=(0x08000000 if sys.platform == "win32" else 0),  # CREATE_NO_WINDOW
+            )
+            launched = True
+            _log("launched via pythonw fallback (--ui)")
+        except OSError as exc:
+            _log(f"pythonw fallback failed: {exc}")
+            print(f"[clap] could not launch Jarvis: {exc}", file=sys.stderr)
+
+    if one_shot and launched:
+        _log("one-shot mode: stopping clap watcher, wake word takes over")
+        print("[clap] handing over to 'hey jarvis' wake word; stopping watcher")
+        _stop_event.set()
 
 
 # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ main loop â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -205,6 +242,7 @@ def run(
     noise_floor: float,
     device: Optional[int],
     dry_run: bool,
+    one_shot: bool,
 ) -> int:
     samplerate = 16000
     blocksize = 512  # ~32 ms per block
@@ -213,9 +251,10 @@ def run(
 
     print(f"[clap] listening on device {device if device is not None else 'default'}")
     print(f"[clap] threshold={threshold:.2f}  noise_floor={noise_floor:.2f}")
+    print(f"[clap] one-shot={one_shot} (default: exits after first launch)")
     print(f"[clap] log: {LOG_PATH}")
-    print("[clap] two quick claps â†’ launch Jarvis. Ctrl+C to stop.")
-    _log(f"startup: threshold={threshold} noise_floor={noise_floor} device={device}")
+    print("[clap] two quick claps -> launch Jarvis. Ctrl+C to stop.")
+    _log(f"startup: threshold={threshold} noise_floor={noise_floor} device={device} one_shot={one_shot}")
 
     def callback(indata, frames, time_info, status):
         if status:
@@ -225,7 +264,7 @@ def run(
         rms = float(np.sqrt(np.mean(samples.astype(np.float32) ** 2)))
         now = time.monotonic()
         if detector.feed(peak, rms, now):
-            launch_jarvis(dry_run=dry_run)
+            launch_jarvis(dry_run=dry_run, one_shot=one_shot)
 
     try:
         with sd.InputStream(
@@ -236,8 +275,10 @@ def run(
             device=device,
             callback=callback,
         ):
-            while True:
-                time.sleep(0.5)
+            while not _stop_event.is_set():
+                time.sleep(0.25)
+        _log("clap watcher done (one-shot fired)")
+        return 0
     except KeyboardInterrupt:
         print("\n[clap] stopping")
         return 0
@@ -259,6 +300,10 @@ def main() -> int:
                         help="Print detections without launching Jarvis.")
     parser.add_argument("--list-devices", action="store_true",
                         help="Print available audio input devices and exit.")
+    parser.add_argument("--continuous", action="store_true",
+                        help="Keep listening after firing (relaunches on every "
+                             "double clap). Default is one-shot: fire once, "
+                             "then hand control to the 'hey jarvis' wake word.")
     args = parser.parse_args()
 
     if args.list_devices:
@@ -266,7 +311,13 @@ def main() -> int:
         return 0
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    return run(args.threshold, args.noise_floor, args.device, args.dry_run)
+    return run(
+        args.threshold,
+        args.noise_floor,
+        args.device,
+        args.dry_run,
+        one_shot=not args.continuous,
+    )
 
 
 if __name__ == "__main__":
