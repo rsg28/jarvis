@@ -38,6 +38,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -46,6 +47,17 @@ import sounddevice as sd
 
 HERE = Path(__file__).resolve().parent
 LOCK_PATH = Path(tempfile.gettempdir()) / "jarvis.lock"
+LOG_PATH  = Path(tempfile.gettempdir()) / "jarvis-clap.log"
+
+
+def _log(msg: str) -> None:
+    """Best-effort append to the clap log so we can debug missed claps."""
+    try:
+        stamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+        with LOG_PATH.open("a", encoding="utf-8") as f:
+            f.write(f"{stamp}  {msg}\n")
+    except OSError:
+        pass
 
 
 # ─────────────────────── clap state machine ───────────────────────
@@ -55,11 +67,11 @@ class ClapDetector:
 
     def __init__(
         self,
-        threshold: float = 0.35,
+        threshold: float = 0.22,
         noise_floor: float = 0.05,
-        min_gap: float = 0.15,
-        max_gap: float = 1.2,
-        cooldown: float = 3.0,
+        min_gap: float = 0.12,
+        max_gap: float = 1.4,
+        cooldown: float = 2.5,
     ) -> None:
         self.threshold = threshold
         self.noise_floor = noise_floor
@@ -84,6 +96,7 @@ class ClapDetector:
             return False
 
         if is_spike:
+            _log(f"spike peak={peak:.3f} rms={rms:.3f} state={self.state}")
             self.last_peak_at = now
             if self.state == "idle":
                 self.state = "one_clap"
@@ -92,10 +105,12 @@ class ClapDetector:
                 gap = now - self.first_clap_at
                 if self.min_gap <= gap <= self.max_gap:
                     # Double clap!
+                    _log(f"DOUBLE CLAP fired (gap={gap*1000:.0f} ms)")
                     self.state = "cool"
                     self.cool_until = now + self.cooldown
                     return True
                 else:
+                    _log(f"spike rejected: gap={gap*1000:.0f} ms outside [{self.min_gap*1000:.0f}, {self.max_gap*1000:.0f}]")
                     # Too fast or too slow — treat this as the new first clap
                     self.first_clap_at = now
         else:
@@ -114,24 +129,43 @@ def _jarvis_is_running() -> bool:
     try:
         pid = int(LOCK_PATH.read_text().strip())
     except (ValueError, OSError):
+        _clean_stale_lock("unreadable")
         return False
-    # On Windows, check whether the PID is still alive
     try:
         import ctypes
         PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        STILL_ACTIVE = 259
         handle = ctypes.windll.kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
-        if handle:
-            ctypes.windll.kernel32.CloseHandle(handle)
-            return True
+        if not handle:
+            _clean_stale_lock(f"pid {pid} dead")
+            return False
+        # Extra check: process might be zombie/exited but still handleable.
+        exit_code = ctypes.c_ulong()
+        ctypes.windll.kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code))
+        ctypes.windll.kernel32.CloseHandle(handle)
+        if exit_code.value != STILL_ACTIVE:
+            _clean_stale_lock(f"pid {pid} exited (code {exit_code.value})")
+            return False
+        return True
+    except Exception as exc:
+        _log(f"lock check failed: {exc}")
         return False
-    except Exception:
-        return False
+
+
+def _clean_stale_lock(reason: str) -> None:
+    _log(f"cleaning stale lock ({reason})")
+    try:
+        LOCK_PATH.unlink()
+    except OSError:
+        pass
 
 
 def launch_jarvis(dry_run: bool = False) -> None:
     if _jarvis_is_running():
+        _log("launch skipped: Jarvis already running")
         print(f"[clap] Jarvis already running (pid in {LOCK_PATH.name}); ignoring double clap")
         return
+    _log("launching Jarvis (launch.bat --voice)")
     print("[clap] double clap detected — launching Jarvis")
     if dry_run:
         return
@@ -171,11 +205,13 @@ def run(
 
     print(f"[clap] listening on device {device if device is not None else 'default'}")
     print(f"[clap] threshold={threshold:.2f}  noise_floor={noise_floor:.2f}")
+    print(f"[clap] log: {LOG_PATH}")
     print("[clap] two quick claps → launch Jarvis. Ctrl+C to stop.")
+    _log(f"startup: threshold={threshold} noise_floor={noise_floor} device={device}")
 
     def callback(indata, frames, time_info, status):
         if status:
-            logging.debug("stream status: %s", status)
+            _log(f"stream status: {status}")
         samples = indata[:, 0] if indata.ndim > 1 else indata
         peak = float(np.max(np.abs(samples)))
         rms = float(np.sqrt(np.mean(samples.astype(np.float32) ** 2)))
@@ -204,9 +240,9 @@ def run(
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Jarvis clap watcher")
-    parser.add_argument("--threshold", type=float, default=0.35,
+    parser.add_argument("--threshold", type=float, default=0.22,
                         help="Peak amplitude that counts as a clap (0-1). "
-                             "Lower = more sensitive. Default 0.35.")
+                             "Lower = more sensitive. Default 0.22.")
     parser.add_argument("--noise-floor", type=float, default=0.05,
                         help="Ambient RMS ceiling to reject sustained noise.")
     parser.add_argument("--device", type=int, default=None,
