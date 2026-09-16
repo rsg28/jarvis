@@ -20,6 +20,16 @@ Google News RSS, and live soccer scores come from ESPN's public JSON.
 | `scores premier` / `scores champions` / `scores peru` | Any league on demand           |
 | `weather in Vancouver`      | wttr.in one-liner (no API key)                           |
 | `what time is it` / `what day is it` | Reads the clock / date                          |
+| `battery` / `cpu` / `ram` / `disk` / `ip` / `wifi` | System readings via psutil        |
+| `volume up` / `down` / `mute` / `set volume 40` | Master volume control          |
+| `pause` / `next` / `previous`| Media keys (works with Spotify, YouTube, VLC, …)        |
+| `screenshot`                | Saves a PNG to your Desktop                              |
+| `set a timer for 25 minutes`| Timers with natural durations                            |
+| `pomodoro`                  | 25-minute focus block, then beeps                        |
+| `remind me in 30 minutes to stretch` | Voice reminders                                 |
+| `timers` / `cancel timers`  | List / cancel active jobs                                |
+| `joke` / `trivia`           | Random jokes (JokeAPI) and trivia (OpenTDB)              |
+| `speak spanish` / `speak english` / `speak french` | Swap the neural voice     |
 | `help`                      | Prints the command list                                  |
 | `quit` / `exit`             | Signs off                                                |
 
@@ -129,6 +139,9 @@ python-tools/jarvis/
 ├── voice.py             edge-tts (neural) → SAPI5 fallback
 ├── news.py              Google News RSS
 ├── soccer.py            ESPN scoreboard JSON
+├── system.py            battery, cpu, ram, disk, ip, wifi, volume, media keys, screenshot
+├── fun.py               jokes (JokeAPI) + trivia (OpenTDB)
+├── scheduler.py         timers, pomodoros, reminders (threaded)
 ├── launch.bat           one-click launcher for the Desktop shortcut
 ├── config.example.toml
 ├── requirements.txt

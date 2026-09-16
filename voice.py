@@ -54,6 +54,13 @@ class Voice:
         if not self._edge_ready:
             self._init_sapi()
 
+    # ────────────── runtime voice swap ──────────────
+    def set_voice(self, voice_name: str) -> str:
+        """Switch to a different neural voice at runtime."""
+        old = self.voice_name
+        self.voice_name = voice_name
+        return f"voice: {old} → {voice_name}"
+
     # ────────────── engine setup ──────────────
     def _init_edge(self) -> bool:
         try:

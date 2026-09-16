@@ -9,7 +9,13 @@ pyaudio>=0.2.14
 
 # News + soccer skills
 feedparser>=6.0          # Google News RSS
-requests>=2.31           # ESPN scoreboard JSON
+requests>=2.31           # ESPN scoreboard, JokeAPI, OpenTDB
+
+# System + media control
+psutil>=5.9              # battery / cpu / ram / disk info
+pycaw>=20240210          # Windows volume set/get via IAudioEndpoint
+comtypes>=1.2            # COM bindings for pycaw
+Pillow>=10.0             # screenshots (PIL.ImageGrab)
 
 # TOML config on Python 3.10 and older
 tomli>=2.0; python_version < "3.11"

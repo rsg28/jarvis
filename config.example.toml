@@ -33,6 +33,9 @@ favorite_league = "la liga"       # default when you say just "scores"
                                   #          serie a, bundesliga, ligue 1,
                                   #          mls, peru, libertadores, europa
 
+[pomodoro]
+work_minutes = 25                 # `pomodoro` command starts a focus block
+
 [apps]
 # Friendly name → what to launch. Edit paths per your machine.
 spotify    = "spotify"
