@@ -31,6 +31,23 @@ enabled = false                   # set true to always run in wake-word mode
 phrases = ["hey jarvis", "jarvis"]
 ack     = "Yes?"                  # what Jarvis says when it hears you
 
+[stt]
+# Speech-to-text tuning. Bump `energy_threshold` if Jarvis is picking up
+# ambient noise; lower it if it's ignoring you. Add / reorder
+# `alt_languages` if you mix in Spanish or French mid-sentence.
+language                    = "en-US"
+alt_languages               = ["es-ES", "fr-FR"]
+energy_threshold            = 300     # min energy floor (higher = less sensitive)
+pause_threshold             = 0.7     # seconds of silence that end a phrase
+phrase_time_limit           = 6.0     # max seconds for the wake utterance
+followup_time_limit         = 10.0    # max seconds for each follow-up command
+conversation_timeout        = 12.0    # silence before we exit conversation mode
+fuzzy_threshold             = 0.78    # 0..1. Lower = more forgiving wake match
+recalibrate_every_seconds   = 300.0   # periodic ambient noise recalibration
+# mic_index                = 2       # pin a specific input device (default: system)
+# List devices:
+#   python -c "import speech_recognition as sr; print(list(enumerate(sr.Microphone.list_microphone_names())))"
+
 [news]
 limit = 5                         # how many headlines to fetch per call
 

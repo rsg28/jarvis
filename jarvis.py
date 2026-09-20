@@ -67,6 +67,28 @@ DEFAULT_CONFIG = {
         "phrases": ["hey jarvis", "jarvis"],
         "ack": "Yes?",
     },
+    "stt": {
+        # Primary Google STT language, plus fallbacks tried when the primary
+        # gives no hypothesis. Keep the primary matching your wake word.
+        "language": "en-US",
+        "alt_languages": ["es-ES", "fr-FR"],
+        # Hard floor for the recognizer's dynamic energy threshold. Higher =
+        # less sensitive (good for noisy rooms). ~300 is a decent starting
+        # point for a headset; try 500-700 for a laptop mic in a busy room.
+        "energy_threshold": 300,
+        "pause_threshold": 0.7,
+        "phrase_time_limit": 6.0,
+        "followup_time_limit": 10.0,
+        "conversation_timeout": 12.0,
+        # 0..1. Lower = more forgiving to mispronunciations, higher = stricter.
+        "fuzzy_threshold": 0.78,
+        # Periodic ambient noise recalibration while running (0 disables).
+        "recalibrate_every_seconds": 300.0,
+        # Optional: pin a specific input device index. Use None (default) for
+        # the system default. Run `python -c "import speech_recognition as sr;
+        # print(list(enumerate(sr.Microphone.list_microphone_names())))"`
+        "mic_index": None,
+    },
     "apps": {
         "spotify":    "spotify",
         "chrome":     "chrome",
@@ -179,38 +201,92 @@ def _read_text() -> str:
         return ""
 
 
-def _make_one_shot_listener():
+def _make_one_shot_listener(config: dict):
     try:
         import speech_recognition as sr
     except ImportError:
         return None
+    stt = config.get("stt", {})
     try:
         r = sr.Recognizer()
-        mic = sr.Microphone()
+        r.pause_threshold = float(stt.get("pause_threshold", 0.7))
+        r.dynamic_energy_threshold = True
+        floor = stt.get("energy_threshold")
+        if floor is not None:
+            r.energy_threshold = int(floor)
+        idx = stt.get("mic_index")
+        try:
+            mic = sr.Microphone(device_index=idx) if idx is not None else sr.Microphone()
+        except Exception:
+            mic = sr.Microphone()
         with mic as source:
             r.adjust_for_ambient_noise(source, duration=0.6)
-        return (r, mic)
+        langs = [stt.get("language", "en-US")] + list(stt.get("alt_languages", []) or [])
+        return (r, mic, langs)
     except Exception:
         return None
 
 
-def _read_voice(listener) -> str:
+def _read_voice(listener, config: dict) -> str:
     import speech_recognition as sr
-    r, mic = listener
+    r, mic, langs = listener
+    stt = config.get("stt", {})
+    phrase_limit = float(stt.get("followup_time_limit", stt.get("phrase_time_limit", 8.0)))
     print("(listening…)")
     try:
         with mic as source:
-            audio = r.listen(source, timeout=6, phrase_time_limit=8)
-        text = r.recognize_google(audio)
-        print(f"you › {text}")
-        return text
+            audio = r.listen(source, timeout=6, phrase_time_limit=phrase_limit)
     except sr.WaitTimeoutError:
-        return ""
-    except sr.UnknownValueError:
         return ""
     except Exception as exc:
         logging.warning("voice input failed: %s", exc)
         return ""
+
+    # Try each language in order; take the first hypothesis we get.
+    for lang in langs:
+        try:
+            raw = r.recognize_google(audio, language=lang, show_all=True)
+        except sr.UnknownValueError:
+            continue
+        except sr.RequestError as exc:
+            logging.warning("Google STT unreachable (%s): %s", lang, exc)
+            continue
+        except Exception as exc:
+            logging.debug("recognize error (%s): %s", lang, exc)
+            continue
+        if raw and isinstance(raw, dict):
+            alts = raw.get("alternative") or []
+            if alts:
+                text = (alts[0].get("transcript") or "").strip()
+                if text:
+                    print(f"you › {text}")
+                    return text
+    return ""
+
+
+# ─────────────────────── wake listener factory ───────────────────────
+
+def _build_wake_listener(config, phrases, on_command, on_wake, pause_flag):
+    """Construct a WakeWordListener wired to the [stt] config block."""
+    from wake import WakeWordListener
+
+    stt = config.get("stt", {})
+    return WakeWordListener(
+        wake_phrases=phrases,
+        on_command=on_command,
+        on_wake=on_wake,
+        pause_flag=pause_flag,
+        language=stt.get("language", "en-US"),
+        alt_languages=stt.get("alt_languages", []),
+        energy_threshold=stt.get("energy_threshold"),
+        pause_threshold=float(stt.get("pause_threshold", 0.7)),
+        phrase_time_limit=float(stt.get("phrase_time_limit", 6.0)),
+        followup_time_limit=float(stt.get("followup_time_limit", 10.0)),
+        conversation_timeout=float(stt.get("conversation_timeout", 12.0)),
+        fuzzy_threshold=float(stt.get("fuzzy_threshold", 0.78)),
+        recalibrate_every_seconds=float(stt.get("recalibrate_every_seconds", 300.0)),
+        mic_index=stt.get("mic_index"),
+    )
 
 
 # ─────────────────────── loop drivers ───────────────────────
@@ -221,14 +297,14 @@ def run_text_or_oneshot(config: dict, voice: Voice, use_voice: bool) -> int:
 
     listener = None
     if use_voice:
-        listener = _make_one_shot_listener()
+        listener = _make_one_shot_listener(config)
         if listener is None:
             print("[jarvis] voice input unavailable, falling back to text.", file=sys.stderr)
             use_voice = False
 
     while True:
         try:
-            command = _read_voice(listener) if use_voice else _read_text()
+            command = _read_voice(listener, config) if use_voice else _read_text()
         except (KeyboardInterrupt, EOFError):
             voice.say("Signing off. Have a productive day.")
             return 0
@@ -300,8 +376,9 @@ def run_ui_loop(config: dict, voice: Voice) -> int:
         cmd_queue.put(text)
 
     # Wake listener on its own daemon thread (unchanged from run_wake_loop).
-    listener = WakeWordListener(
-        wake_phrases=phrases,
+    listener = _build_wake_listener(
+        config,
+        phrases=phrases,
         on_command=_on_command,
         on_wake=_on_wake,
         pause_flag=listener_pause,
@@ -376,8 +453,9 @@ def run_wake_loop(config: dict, voice: Voice) -> int:
     print("[jarvis] you can also type a command any time. Ctrl+C to quit.\n")
 
     try:
-        listener = WakeWordListener(
-            wake_phrases=phrases,
+        listener = _build_wake_listener(
+            config,
+            phrases=phrases,
             on_command=_on_command,
             on_wake=_on_wake,
             pause_flag=pause,
