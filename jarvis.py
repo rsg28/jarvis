@@ -67,6 +67,19 @@ DEFAULT_CONFIG = {
         "phrases": ["hey jarvis", "jarvis"],
         "ack": "Yes?",
     },
+    "llm": {
+        # LLM fallback (Gemini). When the regex intent table can't match a
+        # request, the raw transcript is sent to Gemini which either emits
+        # a canonical command (re-dispatched here) or a short chat reply.
+        # Get a free API key at https://aistudio.google.com/app/apikey
+        # or set the GEMINI_API_KEY env var.
+        "enabled": False,
+        "api_key": "",
+        "model": "gemini-2.5-flash",
+        "temperature": 0.3,
+        "timeout_seconds": 6.0,
+        "history_size": 5,
+    },
     "stt": {
         # Primary Google STT language, plus fallbacks tried when the primary
         # gives no hypothesis. Keep the primary matching your wake word.

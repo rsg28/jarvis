@@ -31,6 +31,20 @@ enabled = false                   # set true to always run in wake-word mode
 phrases = ["hey jarvis", "jarvis"]
 ack     = "Yes?"                  # what Jarvis says when it hears you
 
+[llm]
+# When enabled, requests that don't match the built-in regex intents are
+# forwarded to Gemini. Gemini either returns a canonical Jarvis command
+# ("pon música" -> "play music") or a short spoken answer.
+#
+# Get a free API key at https://aistudio.google.com/app/apikey, or set the
+# GEMINI_API_KEY environment variable instead of putting it here.
+enabled         = false
+api_key         = ""                  # or leave empty + set GEMINI_API_KEY
+model           = "gemini-2.5-flash"
+temperature     = 0.3
+timeout_seconds = 6.0
+history_size    = 5                   # exchanges kept for context ("and tomorrow?")
+
 [stt]
 # Speech-to-text tuning. Bump `energy_threshold` if Jarvis is picking up
 # ambient noise; lower it if it's ignoring you. Add / reorder

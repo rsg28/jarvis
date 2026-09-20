@@ -165,6 +165,42 @@ type into the terminal gets dispatched the same way as a spoken
 command. While Jarvis is speaking, the listener is automatically
 paused so it doesn't hear itself.
 
+## Natural language (LLM fallback)
+
+Out of the box Jarvis matches commands with a regex table. That's fast
+and offline, but it means you have to phrase things a specific way.
+
+Turn on the LLM fallback and Jarvis handles free-form requests too:
+
+- *"pon música chill en spotify"* → `play chill music`
+- *"sube el volumen un poquito"* → `volume up`
+- *"qué hora es y cuánto falta para las 5?"* → tells the time and does the math
+- *"cómo se dice hello en francés?"* → answers in French out loud
+- *"resume in one sentence what a raspberry pi is"* → short spoken answer
+
+When nothing in the built-in intent table matches, the transcript is
+sent to Gemini with a system prompt describing every canonical command
+Jarvis knows. Gemini either emits a canonical command (re-dispatched
+through the same code path as a typed one) or a short conversational
+reply that Jarvis speaks back. The last few exchanges are kept as
+context so follow-ups like *"and tomorrow?"* still work.
+
+Enable it in `config.toml`:
+
+```toml
+[llm]
+enabled         = true
+api_key         = "..."             # or export GEMINI_API_KEY instead
+model           = "gemini-2.5-flash"
+temperature     = 0.3
+timeout_seconds = 6.0
+history_size    = 5
+```
+
+Free API key: <https://aistudio.google.com/app/apikey>. No new pip
+package — the module uses `requests`, which was already required for
+news and soccer.
+
 ## Voice
 
 The default is `en-US-JennyNeural` (warm female US). Change it in

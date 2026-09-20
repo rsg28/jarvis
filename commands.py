@@ -32,6 +32,13 @@ class CommandDispatcher:
         self.apps = config.get("apps", {})
         # Lazy scheduler — created on first timer/reminder
         self._scheduler = None
+        # Lazy LLM fallback — only built if [llm].enabled = true and a key
+        # is available. `None` means "regex-only mode".
+        from llm import build_from_config
+        self._llm = build_from_config(config)
+        # Re-entrancy guard so an LLM-produced command that also fails to
+        # match never triggers another LLM round-trip.
+        self._in_llm_dispatch = False
 
     def _get_scheduler(self):
         if self._scheduler is None:
@@ -49,12 +56,69 @@ class CommandDispatcher:
         for pattern, handler in INTENTS:
             match = re.match(pattern, text, re.IGNORECASE)
             if match:
-                return handler(self, match)
+                result = handler(self, match)
+                self._remember(text, result)
+                return result
+
+        # Nothing matched — try the LLM before giving up.
+        if self._llm is not None and not self._in_llm_dispatch:
+            llm_result = self._try_llm(text)
+            if llm_result is not None:
+                self._remember(text, llm_result)
+                return llm_result
 
         return CommandResult(
             speak="I did not catch that. Say help to see what I can do.",
             print_out=f"[jarvis] not recognized: {text!r}. Try 'help'.",
         )
+
+    # ────────────── LLM fallback ──────────────
+    def _try_llm(self, text: str) -> Optional[CommandResult]:
+        """Ask Gemini to convert the transcript into either a canonical
+        command (re-dispatched here) or a short chat reply (spoken)."""
+        parsed = self._llm.infer(text)
+        if not parsed:
+            return None
+
+        action = (parsed.get("action") or "").lower()
+
+        if action == "call_intent":
+            command = (parsed.get("command") or "").strip()
+            if not command:
+                return None
+            # Re-dispatch the LLM's canonical command through the same
+            # regex table so the execution path is identical to a typed
+            # command. The re-entrancy guard prevents an LLM ping-pong.
+            self._in_llm_dispatch = True
+            try:
+                inner = self.dispatch(command)
+            finally:
+                self._in_llm_dispatch = False
+            # If even the canonical command failed to match, treat the
+            # LLM's own reply (if any) as a chat fallback.
+            if inner.speak and not inner.speak.startswith("I did not catch that"):
+                return inner
+            reply = (parsed.get("reply") or "").strip()
+            if reply:
+                return CommandResult(speak=reply, print_out=reply)
+            return inner
+
+        if action == "chat":
+            reply = (parsed.get("reply") or "").strip()
+            if not reply:
+                return None
+            return CommandResult(speak=reply, print_out=reply)
+
+        return None
+
+    def _remember(self, user_text: str, result: CommandResult) -> None:
+        """Feed successful exchanges back into the LLM's context window
+        so follow-up questions like 'and tomorrow?' have anchor."""
+        if self._llm is None:
+            return
+        reply = result.speak or result.print_out or ""
+        if reply:
+            self._llm.remember(user_text, reply)
 
     # ────────────── existing skills ──────────────
     def _open_app(self, name: str) -> CommandResult:
