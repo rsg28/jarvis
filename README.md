@@ -165,6 +165,37 @@ type into the terminal gets dispatched the same way as a spoken
 command. While Jarvis is speaking, the listener is automatically
 paused so it doesn't hear itself.
 
+## Open / read anything by name
+
+Jarvis can resolve **any app, file, folder or URL** on your machine by
+name. Under the hood it walks a small set of roots (Desktop, Documents,
+Downloads, Start Menu shortcuts, all OneDrive equivalents, plus any
+extra folders you configure) and picks the best fuzzy match.
+
+```
+open spotify                   # Start Menu shortcut
+open my resume                 # Raul_Resume.pdf in ~/Documents
+open the downloads folder      # folder, not a file
+open github.com                # URL, opens in default browser
+open C:\path\to\file.pdf       # explicit path — always allowed
+read the todo list             # speaks an excerpt, prints the rest
+read config.toml               # reads and prints text files
+find gomero                    # list matches without opening
+```
+
+`read` is guarded — it refuses non-text files and caps output at
+200 KB (configurable). Nothing here writes, deletes, or executes
+arbitrary shell strings; opening uses the OS default association
+(same as a double-click).
+
+Add more roots in `config.toml`:
+
+```toml
+[resolver]
+extra_roots = ["C:/Users/you/projects", "D:/vault"]
+read_max_bytes = 200000
+```
+
 ## Natural language (LLM fallback)
 
 Out of the box Jarvis matches commands with a regex table. That's fast

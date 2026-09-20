@@ -6,6 +6,8 @@ skill is dropping a new pair into `INTENTS` — nothing else changes.
 """
 from __future__ import annotations
 
+import logging
+import os
 import platform
 import re
 import subprocess
@@ -13,6 +15,7 @@ import urllib.parse
 import webbrowser
 from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
 from typing import Callable, Optional
 
 
@@ -122,10 +125,67 @@ class CommandDispatcher:
 
     # ────────────── existing skills ──────────────
     def _open_app(self, name: str) -> CommandResult:
+        """Open anything by name. Resolution order:
+
+        1. Explicit `apps` mapping in config (fastest, always wins).
+        2. Direct URL / path if the target already looks like one.
+        3. Fuzzy resolver against Desktop / Documents / Downloads / Start
+           Menu shortcuts, plus any extra roots configured in `[resolver]`.
+        4. Windows shell fallback (`start "" name`) which works for things
+           on PATH like `notepad`, `calc`, `wt`, `code`.
+        """
+        name = (name or "").strip().strip('"').strip("'")
+        if not name:
+            return CommandResult(speak="Open what, sir?", print_out="[jarvis] empty open target")
+
+        # 1. Explicit mapping — user's curated shortcuts.
         cmd = self.apps.get(name.lower())
-        if not cmd:
-            return CommandResult(speak=f"I don't know how to open {name} yet.",
-                                 print_out=f"[jarvis] no app mapping for {name!r}")
+        if cmd:
+            return self._launch(cmd, spoken=f"Opening {name}.",
+                                print_line=f"[jarvis] launched mapping {cmd!r}")
+
+        # 2. URL?
+        import resolver as _r
+        if _r.looks_like_url(name):
+            url = _r.normalize_url(name)
+            webbrowser.open(url)
+            return CommandResult(speak=f"Opening {name} in the browser.",
+                                 print_out=f"[jarvis] opened {url}")
+
+        # 3. Absolute / relative path?
+        if _r.looks_like_path(name):
+            path = _r.resolve_path(name)
+            if path is not None:
+                return self._open_resolved(path, name)
+            return CommandResult(speak=f"I couldn't find {name}.",
+                                 print_out=f"[jarvis] path not found: {name}")
+
+        # 4. Fuzzy search across common roots.
+        extra = self.config.get("resolver", {}).get("extra_roots", []) or []
+        matches = _r.find_targets(
+            name,
+            roots=extra,
+            kinds=("app", "file", "folder"),
+            limit=3,
+        )
+        if matches:
+            top = matches[0]
+            return self._open_resolved(Path(top.path), top.name,
+                                       extra_hint=self._hint_others(matches[1:]))
+
+        # 5. Windows shell fallback — lets `open notepad` / `open wt` work.
+        if platform.system() == "Windows":
+            try:
+                subprocess.Popen(f'start "" {name}', shell=True)
+                return CommandResult(speak=f"Opening {name}.",
+                                     print_out=f"[jarvis] shell start {name}")
+            except Exception as exc:
+                logging.debug("shell start failed for %s: %s", name, exc)
+
+        return CommandResult(speak=f"I could not find {name} anywhere.",
+                             print_out=f"[jarvis] no resolver hit for {name!r}")
+
+    def _launch(self, cmd: str, *, spoken: str, print_line: str) -> CommandResult:
         try:
             if platform.system() == "Windows":
                 subprocess.Popen(f"start {cmd}", shell=True)
@@ -133,10 +193,38 @@ class CommandDispatcher:
                 subprocess.Popen(["open", "-a", cmd])
             else:
                 subprocess.Popen([cmd])
-            return CommandResult(speak=f"Opening {name}.", print_out=f"[jarvis] launched {cmd}")
+            return CommandResult(speak=spoken, print_out=print_line)
         except Exception as exc:
-            return CommandResult(speak=f"I could not open {name}.",
+            return CommandResult(speak="I could not open that.",
                                  print_out=f"[jarvis] launch failed: {exc}")
+
+    def _open_resolved(self, path: Path, spoken_name: str,
+                       *, extra_hint: str = "") -> CommandResult:
+        """Open a filesystem target we've already resolved. Uses the OS
+        default association (double-click equivalent) — safe for apps,
+        docs, folders, images, media."""
+        try:
+            if platform.system() == "Windows":
+                os.startfile(str(path))  # nosec — user-initiated
+            elif platform.system() == "Darwin":
+                subprocess.Popen(["open", str(path)])
+            else:
+                subprocess.Popen(["xdg-open", str(path)])
+            spoken = f"Opening {spoken_name}."
+            if extra_hint:
+                spoken += " " + extra_hint
+            return CommandResult(speak=spoken,
+                                 print_out=f"[jarvis] opened {path}")
+        except Exception as exc:
+            return CommandResult(speak=f"I couldn't open {spoken_name}.",
+                                 print_out=f"[jarvis] open failed: {exc}")
+
+    @staticmethod
+    def _hint_others(others) -> str:
+        if not others:
+            return ""
+        names = ", ".join(m.name for m in others[:2])
+        return f"I also saw {names} — say 'find <name>' to list all matches."
 
     def _search_web(self, query: str) -> CommandResult:
         url = f"https://www.google.com/search?q={urllib.parse.quote_plus(query)}"
@@ -348,13 +436,89 @@ class CommandDispatcher:
         line = msgs[lang.lower()]
         return CommandResult(speak=line, print_out=f"[jarvis] voice → {voice_name}")
 
+    # ────────────── read / find files ──────────────
+    def _read_file(self, target: str) -> CommandResult:
+        """Read a text file by name and speak an excerpt. Full contents
+        go to the terminal / HUD transcript."""
+        target = (target or "").strip().strip('"').strip("'")
+        if not target:
+            return CommandResult(speak="Read what, sir?",
+                                 print_out="[jarvis] empty read target")
+
+        import resolver as _r
+
+        # Explicit path first, then fuzzy search restricted to text files.
+        if _r.looks_like_path(target):
+            path = _r.resolve_path(target)
+            if path is None or not path.is_file():
+                return CommandResult(speak=f"I couldn't find {target}.",
+                                     print_out=f"[jarvis] read: not found: {target}")
+        else:
+            extra = self.config.get("resolver", {}).get("extra_roots", []) or []
+            match = _r.find_best(target, roots=extra, kinds=("file",), text_only=True)
+            if match is None:
+                return CommandResult(
+                    speak=f"I couldn't find a text file matching {target}.",
+                    print_out=f"[jarvis] read: no match for {target!r}",
+                )
+            path = Path(match.path)
+
+        max_bytes = int(self.config.get("resolver", {}).get("read_max_bytes", 200_000))
+        try:
+            text = _r.read_text_file(path, max_bytes=max_bytes)
+        except ValueError as exc:
+            return CommandResult(speak=str(exc),
+                                 print_out=f"[jarvis] read refused: {exc}")
+        except Exception as exc:
+            return CommandResult(speak="I couldn't read that file.",
+                                 print_out=f"[jarvis] read failed: {exc}")
+
+        excerpt = self._speech_excerpt(text)
+        header = f"── {path.name} ──"
+        return CommandResult(
+            speak=f"{path.name}. {excerpt}",
+            print_out=f"{header}\n{text}",
+        )
+
+    @staticmethod
+    def _speech_excerpt(text: str, limit: int = 600) -> str:
+        """Trim a file to something reasonable to speak out loud."""
+        t = " ".join(text.split())
+        if len(t) <= limit:
+            return t
+        return t[:limit].rsplit(" ", 1)[0] + "…"
+
+    def _find(self, target: str) -> CommandResult:
+        """List matching apps / files / folders without opening anything."""
+        target = (target or "").strip()
+        if not target:
+            return CommandResult(speak="Find what, sir?",
+                                 print_out="[jarvis] empty find target")
+        import resolver as _r
+        extra = self.config.get("resolver", {}).get("extra_roots", []) or []
+        matches = _r.find_targets(target, roots=extra, limit=8)
+        if not matches:
+            return CommandResult(speak=f"No matches for {target}.",
+                                 print_out=f"[jarvis] find: no match")
+        lines = [f"── Matches for {target!r} ──"]
+        for i, m in enumerate(matches, 1):
+            lines.append(f"  {i}. [{m.kind}] {m.name}   ({m.score:.2f})   {m.path}")
+        spoken = f"I found {len(matches)} match{'es' if len(matches) != 1 else ''}: "
+        spoken += ", ".join(m.name for m in matches[:3])
+        return CommandResult(speak=spoken, print_out="\n".join(lines))
+
     # ────────────── help / quit ──────────────
     def _help(self, _match) -> CommandResult:
         # In UI mode this pops open a stylised help panel next to the orb.
         # In text/wake mode the same lines print to stdout via `print_out`.
         lines = [
             "Commands:",
-            "  open <app>              e.g. open spotify, open chrome, open code",
+            "  open <anything>         apps, files, folders, URLs — resolved by name",
+            "                          e.g. open spotify, open my resume, open OneDrive",
+            "                                open github.com, open C:\\Users\\...\\file.pdf",
+            "  read <file>             speaks an excerpt of a text file, prints the rest",
+            "                          e.g. read the todo list, read config.toml",
+            "  find <name>             list matching apps / files / folders (no launch)",
             "  search <query>          Google search in your browser",
             "  play <query>            search Spotify",
             "  play/pause | next | previous     media control keys",
@@ -472,16 +636,24 @@ INTENTS: list[tuple[str, Callable[["CommandDispatcher", re.Match], CommandResult
     (r"^(?:speak|switch\s+to)\s+(?P<lang>english|spanish|french|british)$",
      lambda d, m: d._speak_lang(m.group("lang"))),
 
-    # App launcher — MUST come after the specific commands above
-    (r"^open\s+(?P<app>.+)$",
-     lambda d, m: d._open_app(m.group("app").strip())),
-    (r"^launch\s+(?P<app>.+)$",
+    # Read a file by name or path — speaks an excerpt, prints the whole thing.
+    (r"^(?:read|open\s+and\s+read|show(?:\s+me)?)\s+(?:the\s+(?:file\s+)?|file\s+)?(?P<q>.+)$",
+     lambda d, m: d._read_file(m.group("q").strip())),
+    (r"^what.?s\s+in\s+(?:the\s+file\s+|file\s+|my\s+)?(?P<q>.+?)\s*\??$",
+     lambda d, m: d._read_file(m.group("q").strip())),
+
+    # Find a target without opening it — great for disambiguation.
+    (r"^(?:find|locate|where\s+is)\s+(?P<q>.+?)\s*\??$",
+     lambda d, m: d._find(m.group("q").strip())),
+
+    # App / file / folder / URL launcher — MUST come after the specific commands above.
+    (r"^(?:open|launch|start|run)\s+(?P<app>.+)$",
      lambda d, m: d._open_app(m.group("app").strip())),
 
     # Search
     (r"^(?:google|search)\s+(?:for\s+)?(?P<q>.+)$",
      lambda d, m: d._search_web(m.group("q").strip())),
-    (r"^(?:look\s+up|find)\s+(?P<q>.+)$",
+    (r"^look\s+up\s+(?P<q>.+)$",
      lambda d, m: d._search_web(m.group("q").strip())),
 
     # Spotify search — `play <song>` and `spotify <song>`

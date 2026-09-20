@@ -42,8 +42,12 @@ Always respond with a single valid JSON object, no code fences, no prose.
 ============ Available canonical commands ============
 Prefer these EXACT phrasings when you emit `call_intent`:
 
-  open <app>                     e.g. "open spotify", "open chrome", "open code",
-                                       "open notepad", "open calculator", "open terminal"
+  open <anything>                Apps, files, folders, URLs — resolved by name.
+                                 e.g. "open spotify", "open my resume", "open github.com",
+                                       "open the downloads folder", "open C:\\path\\to\\file.pdf"
+  read <file>                    Read a text file by name and speak an excerpt.
+                                 e.g. "read the todo list", "read config.toml"
+  find <name>                    List matching apps / files without opening.
   search <query>                 Google search
   play <query>                   search Spotify
   pause | play | next | previous media control keys (whatever is playing)

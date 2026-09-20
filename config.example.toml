@@ -31,6 +31,19 @@ enabled = false                   # set true to always run in wake-word mode
 phrases = ["hey jarvis", "jarvis"]
 ack     = "Yes?"                  # what Jarvis says when it hears you
 
+[resolver]
+# Extra folders the `open`, `read`, and `find` commands should search on
+# top of the defaults (Desktop, Documents, Downloads, Start Menu, plus
+# any OneDrive equivalents). Add project vaults, code roots, mounted
+# drives, etc.
+extra_roots = [
+  # "C:/Users/you/projects",
+  # "D:/vault",
+]
+# Hard cap for `read <file>`. Anything past this is truncated with a
+# clear marker. 200 KB is comfortable for logs / CSVs / source files.
+read_max_bytes = 200000
+
 [llm]
 # When enabled, requests that don't match the built-in regex intents are
 # forwarded to Gemini. Gemini either returns a canonical Jarvis command
