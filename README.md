@@ -191,7 +191,7 @@ Enable it in `config.toml`:
 [llm]
 enabled         = true
 api_key         = "..."             # or export GEMINI_API_KEY instead
-model           = "gemini-2.5-flash"
+model           = "gemini-3.6-flash"
 temperature     = 0.3
 timeout_seconds = 6.0
 history_size    = 5

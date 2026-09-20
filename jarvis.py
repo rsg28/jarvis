@@ -75,7 +75,7 @@ DEFAULT_CONFIG = {
         # or set the GEMINI_API_KEY env var.
         "enabled": False,
         "api_key": "",
-        "model": "gemini-2.5-flash",
+        "model": "gemini-3.6-flash",
         "temperature": 0.3,
         "timeout_seconds": 6.0,
         "history_size": 5,

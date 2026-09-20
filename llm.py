@@ -86,7 +86,7 @@ class LLM:
     def __init__(
         self,
         api_key: str,
-        model: str = "gemini-2.5-flash",
+        model: str = "gemini-3.6-flash",
         temperature: float = 0.3,
         timeout: float = 6.0,
         history_size: int = 5,
@@ -128,14 +128,24 @@ class LLM:
             },
         }
 
-        try:
-            resp = requests.post(url, json=payload, timeout=self.timeout)
-        except Exception as exc:
-            logging.warning("LLM request failed: %s", exc)
-            return None
-
-        if resp.status_code != 200:
+        # 1 retry on transient errors (503 overload, 429 rate-limit) with
+        # a short back-off. Anything else is fatal for this turn.
+        import time as _time
+        resp = None
+        for attempt in range(2):
+            try:
+                resp = requests.post(url, json=payload, timeout=self.timeout)
+            except Exception as exc:
+                logging.warning("LLM request failed: %s", exc)
+                return None
+            if resp.status_code == 200:
+                break
+            if resp.status_code in (429, 500, 502, 503, 504) and attempt == 0:
+                _time.sleep(0.6)
+                continue
             logging.warning("LLM HTTP %s: %s", resp.status_code, resp.text[:200])
+            return None
+        if resp is None or resp.status_code != 200:
             return None
 
         try:
@@ -196,7 +206,7 @@ def build_from_config(config: dict) -> Optional["LLM"]:
         return None
     return LLM(
         api_key=api_key,
-        model=llm_cfg.get("model", "gemini-2.5-flash"),
+        model=llm_cfg.get("model", "gemini-3.6-flash"),
         temperature=float(llm_cfg.get("temperature", 0.3)),
         timeout=float(llm_cfg.get("timeout_seconds", 6.0)),
         history_size=int(llm_cfg.get("history_size", 5)),

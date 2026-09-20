@@ -40,7 +40,7 @@ ack     = "Yes?"                  # what Jarvis says when it hears you
 # GEMINI_API_KEY environment variable instead of putting it here.
 enabled         = false
 api_key         = ""                  # or leave empty + set GEMINI_API_KEY
-model           = "gemini-2.5-flash"
+model           = "gemini-3.6-flash"
 temperature     = 0.3
 timeout_seconds = 6.0
 history_size    = 5                   # exchanges kept for context ("and tomorrow?")
