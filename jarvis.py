@@ -88,7 +88,7 @@ DEFAULT_CONFIG = {
         # Combo syntax matches the `keyboard` package: e.g.
         #   "ctrl+alt+j"  "win+space"  "f9"  "ctrl+shift+space"
         "enabled": True,
-        "combo": "ctrl+alt+j",
+        "combo": "ctrl+shift+space",
         # When true, speak a very short "Yes?" cue after the combo is
         # pressed so you know Jarvis is listening. Set to false for
         # completely silent activation.
@@ -287,22 +287,29 @@ def _read_voice(listener, config: dict, speaker_verifier=None) -> str:
                                            convert_width=2)
             ok, sim = speaker_verifier.is_owner(wav_bytes)
             if not ok:
-                print(f"[speaker] rejected (sim={sim:.2f} < {speaker_verifier.threshold:.2f})")
+                # INFO (not debug) so the reason for silent no-ops is
+                # always visible in jarvis.log.
+                logging.info("[speaker] rejected (sim=%.2f < %.2f)",
+                             sim, speaker_verifier.threshold)
                 return ""
-            logging.debug("speaker: accepted (sim=%.2f)", sim)
+            logging.info("[speaker] accepted (sim=%.2f)", sim)
         except Exception as exc:
-            logging.debug("speaker verification failed on one-shot audio: %s", exc)
+            logging.warning("speaker verification failed on one-shot audio: %s", exc)
 
     # Try each language in order; take the first hypothesis we get.
+    tried = []
     for lang in langs:
         try:
             raw = r.recognize_google(audio, language=lang, show_all=True)
         except sr.UnknownValueError:
+            tried.append(f"{lang}=unknown")
             continue
         except sr.RequestError as exc:
+            tried.append(f"{lang}=net-err")
             logging.warning("Google STT unreachable (%s): %s", lang, exc)
             continue
         except Exception as exc:
+            tried.append(f"{lang}=err")
             logging.debug("recognize error (%s): %s", lang, exc)
             continue
         if raw and isinstance(raw, dict):
@@ -310,8 +317,14 @@ def _read_voice(listener, config: dict, speaker_verifier=None) -> str:
             if alts:
                 text = (alts[0].get("transcript") or "").strip()
                 if text:
-                    print(f"you › {text}")
+                    logging.info("[stt %s] you > %s", lang, text)
+                    try:
+                        print(f"you › {text}")
+                    except Exception:
+                        pass
                     return text
+            tried.append(f"{lang}=no-alt")
+    logging.info("[stt] no transcription (%s)", ", ".join(tried) or "no langs")
     return ""
 
 
@@ -606,26 +619,46 @@ def run_hotkey_loop(config: dict, voice: Voice) -> int:
             listener_holder["listener"] = _make_one_shot_listener(config)
         return listener_holder["listener"]
 
+    def _safe_print(*args) -> None:
+        # Under pythonw.exe, sys.stdout is None and print() raises.
+        # We mirror everything to logging so it always shows up in the
+        # redirected log file regardless of launcher.
+        try:
+            print(*args)
+        except Exception:
+            pass
+        try:
+            logging.info(" ".join(str(a) for a in args))
+        except Exception:
+            pass
+
     def _on_hotkey() -> None:
-        print(f"\n[hotkey] {combo} pressed — listening…")
+        _safe_print(f"[hotkey] {combo} pressed — listening…")
         listener = _ensure_listener()
         if listener is None:
-            print("[hotkey] voice input unavailable (SpeechRecognition/pyaudio missing).")
+            _safe_print("[hotkey] voice input unavailable (SpeechRecognition/pyaudio missing).")
             return
         if ack_enabled:
-            voice.say("Yes?")
+            try:
+                voice.say("Yes?")
+            except Exception as exc:
+                logging.warning("voice ack failed: %s", exc)
         try:
             text = _read_voice(listener, config, speaker_verifier=speaker_verifier)
         except Exception as exc:
             logging.exception("hotkey listen failed: %s", exc)
             return
         if not text:
-            return  # empty transcript or rejected speaker → silent no-op
-        result = dispatcher.dispatch(text)
-        if result.speak:
-            voice.say(result.speak)
-        if result.print_out:
-            print(result.print_out)
+            _safe_print("[hotkey] no command captured (empty or rejected)")
+            return
+        try:
+            result = dispatcher.dispatch(text)
+            if result.speak:
+                voice.say(result.speak)
+            if result.print_out:
+                _safe_print(result.print_out)
+        except Exception as exc:
+            logging.exception("dispatch failed: %s", exc)
 
     hotkey = HotkeyListener(combo, _on_hotkey)
     if not hotkey.start():
@@ -660,7 +693,18 @@ def main() -> int:
                         help="Disable hotkey mode even if [hotkey].enabled=true")
     args = parser.parse_args()
 
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    # Always tee logs to a file so hotkey / VBS launches (pythonw.exe,
+    # stdout=None) still leave a trace we can inspect later.
+    log_path = Path(__file__).parent / "jarvis.log"
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s",
+        handlers=[
+            logging.FileHandler(log_path, encoding="utf-8"),
+            logging.StreamHandler(),  # stderr — swallowed under pythonw, that's fine
+        ],
+    )
+    logging.info("jarvis boot: argv=%s cwd=%s", sys.argv, Path.cwd())
     _write_lock()
     config = load_config(args.config)
     voice = Voice(
