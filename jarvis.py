@@ -80,6 +80,20 @@ DEFAULT_CONFIG = {
         "timeout_seconds": 6.0,
         "history_size": 5,
     },
+    "hotkey": {
+        # Push-to-talk trigger. When enabled, Jarvis registers a global
+        # keyboard shortcut and only listens when you press it. This is
+        # the preferred entry point — quieter and more reliable than
+        # always-listening wake-word mode.
+        # Combo syntax matches the `keyboard` package: e.g.
+        #   "ctrl+alt+j"  "win+space"  "f9"  "ctrl+shift+space"
+        "enabled": True,
+        "combo": "ctrl+alt+j",
+        # When true, speak a very short "Yes?" cue after the combo is
+        # pressed so you know Jarvis is listening. Set to false for
+        # completely silent activation.
+        "ack": True,
+    },
     "speaker": {
         # Speaker verification. When enabled and a voiceprint has been
         # enrolled (via `python enroll_voice.py`), Jarvis only responds
@@ -153,25 +167,25 @@ def _release_lock() -> None:
         pass
 
 
-def morning_greeting(voice: Voice, name: str, address: str) -> str:
-    hour = datetime.now().hour
-    if hour < 12:
-        greet = f"Good morning, {address}" if address else f"Good morning, {name}"
-    elif hour < 18:
-        greet = f"Good afternoon, {address}" if address else f"Good afternoon, {name}"
-    else:
-        greet = f"Good evening, {address}" if address else f"Good evening, {name}"
-    now = datetime.now().strftime("%A, %B %d — %I:%M %p")
-    line = f"{greet}. It is {now}. At your service."
+def simple_greeting(voice: Voice, name: str) -> str:
+    """Minimal boot greeting — just the user's name, no date/time/formality.
+
+    (Previous versions included time-of-day, weekday, and 'at your service';
+    the owner asked to strip all of that down to a plain acknowledgment.)
+    """
+    line = f"Hello, {name}."
     voice.say(line)
     return line
 
 
+# Backwards-compat alias so nothing that imports `morning_greeting` breaks.
+morning_greeting = simple_greeting  # type: ignore[assignment]
+
+
 def boot(config: dict, voice: Voice) -> None:
     name = config["user"]["name"]
-    address = config["user"].get("address", "")
     print("\n=== JARVIS · online ===")
-    morning_greeting(voice, name, address)
+    simple_greeting(voice, name)
 
     startup = config["startup"]
     if startup.get("open_spotify", True):
@@ -250,7 +264,7 @@ def _make_one_shot_listener(config: dict):
         return None
 
 
-def _read_voice(listener, config: dict) -> str:
+def _read_voice(listener, config: dict, speaker_verifier=None) -> str:
     import speech_recognition as sr
     r, mic, langs = listener
     stt = config.get("stt", {})
@@ -264,6 +278,20 @@ def _read_voice(listener, config: dict) -> str:
     except Exception as exc:
         logging.warning("voice input failed: %s", exc)
         return ""
+
+    # Speaker gate — if a non-owner voice trips this session, drop it
+    # silently. Fails-open when disabled/not enrolled.
+    if speaker_verifier is not None and speaker_verifier.enrolled and speaker_verifier.available:
+        try:
+            wav_bytes = audio.get_wav_data(convert_rate=speaker_verifier.sample_rate,
+                                           convert_width=2)
+            ok, sim = speaker_verifier.is_owner(wav_bytes)
+            if not ok:
+                print(f"[speaker] rejected (sim={sim:.2f} < {speaker_verifier.threshold:.2f})")
+                return ""
+            logging.debug("speaker: accepted (sim=%.2f)", sim)
+        except Exception as exc:
+            logging.debug("speaker verification failed on one-shot audio: %s", exc)
 
     # Try each language in order; take the first hypothesis we get.
     for lang in langs:
@@ -552,6 +580,69 @@ def run_wake_loop(config: dict, voice: Voice) -> int:
             return 0
 
 
+def run_hotkey_loop(config: dict, voice: Voice) -> int:
+    """Push-to-talk mode. Registers a global hotkey; each press captures
+    a single utterance, verifies the speaker, and dispatches the command.
+
+    Silent by default: no wake-word listening in the background, no
+    always-on STT. Ideal for shared spaces where you don't want the mic
+    to be perpetually hot.
+    """
+    from hotkey import HotkeyListener
+
+    dispatcher = CommandDispatcher(config=config, voice=voice)
+    speaker_verifier = _build_speaker_verifier(config)
+    hotkey_cfg = config.get("hotkey", {})
+    combo = hotkey_cfg.get("combo", "ctrl+alt+j")
+    ack_enabled = bool(hotkey_cfg.get("ack", True))
+
+    # One-shot listener is heavy to construct (ambient-noise calibration
+    # opens the mic for ~600 ms); build it lazily on first press so
+    # process startup stays fast.
+    listener_holder: dict = {"listener": None}
+
+    def _ensure_listener():
+        if listener_holder["listener"] is None:
+            listener_holder["listener"] = _make_one_shot_listener(config)
+        return listener_holder["listener"]
+
+    def _on_hotkey() -> None:
+        print(f"\n[hotkey] {combo} pressed — listening…")
+        listener = _ensure_listener()
+        if listener is None:
+            print("[hotkey] voice input unavailable (SpeechRecognition/pyaudio missing).")
+            return
+        if ack_enabled:
+            voice.say("Yes?")
+        try:
+            text = _read_voice(listener, config, speaker_verifier=speaker_verifier)
+        except Exception as exc:
+            logging.exception("hotkey listen failed: %s", exc)
+            return
+        if not text:
+            return  # empty transcript or rejected speaker → silent no-op
+        result = dispatcher.dispatch(text)
+        if result.speak:
+            voice.say(result.speak)
+        if result.print_out:
+            print(result.print_out)
+
+    hotkey = HotkeyListener(combo, _on_hotkey)
+    if not hotkey.start():
+        print("[jarvis] could not register global hotkey; falling back to text mode.")
+        return run_text_or_oneshot(config, voice, use_voice=False)
+
+    print(f"\n=== JARVIS · armed ===")
+    print(f"Press {combo.upper()} from any app to talk. Ctrl+C to quit.\n")
+    try:
+        hotkey.wait_forever()
+    except KeyboardInterrupt:
+        print("\n[jarvis] shutting down.")
+    finally:
+        hotkey.stop()
+    return 0
+
+
 # ─────────────────────── main ───────────────────────
 
 def main() -> int:
@@ -563,6 +654,10 @@ def main() -> int:
                         help="Always-listening wake-word mode ('hey jarvis')")
     parser.add_argument("--ui",    action="store_true",
                         help="Wake mode with a floating orb HUD")
+    parser.add_argument("--hotkey", action="store_true",
+                        help="Push-to-talk mode: press a global hotkey to speak (default)")
+    parser.add_argument("--no-hotkey", action="store_true",
+                        help="Disable hotkey mode even if [hotkey].enabled=true")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -580,15 +675,23 @@ def main() -> int:
     if not args.no_greet:
         boot(config, voice)
 
-    # Config-driven default: `[wake].enabled = true` also triggers wake mode.
-    wake_mode = args.wake or config.get("wake", {}).get("enabled", False)
+    # Config-driven defaults. Mode precedence (most explicit wins):
+    #   --ui       > --wake > --hotkey > --voice > text
+    # If no flag is given, we fall back to the [*].enabled flags in
+    # config.toml. Hotkey mode is the recommended default now.
     ui_mode = args.ui or config.get("ui", {}).get("enabled", False)
+    wake_mode = args.wake or config.get("wake", {}).get("enabled", False)
+    hotkey_mode = (args.hotkey or config.get("hotkey", {}).get("enabled", False)) \
+                  and not args.no_hotkey
 
     if ui_mode:
         return run_ui_loop(config, voice)
 
     if wake_mode:
         return run_wake_loop(config, voice)
+
+    if hotkey_mode:
+        return run_hotkey_loop(config, voice)
 
     print("\nType a command (help / quit).")
     return run_text_or_oneshot(config, voice, use_voice=args.voice)

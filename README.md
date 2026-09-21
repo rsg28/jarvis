@@ -45,12 +45,36 @@ copy config.example.toml config.toml
 ## Run
 
 ```powershell
-python jarvis.py               # boot routine + text loop
-python jarvis.py --no-greet    # skip the "good morning"
+python jarvis.py               # DEFAULT: push-to-talk (Ctrl+Alt+J from any app)
+python jarvis.py --no-hotkey   # plain text loop, no hotkey
+python jarvis.py --no-greet    # skip the boot greeting
 python jarvis.py --voice       # one-shot microphone input
 python jarvis.py --wake        # always-listening ("hey jarvis")
 python jarvis.py --ui          # always-listening + floating orb HUD
 ```
+
+### Push-to-talk (recommended)
+
+Wake-word mode is unreliable in noisy rooms and burns CPU running STT
+on every ambient sound. Push-to-talk is the new default:
+
+- Press **Ctrl+Alt+J** from any application → Jarvis says "Yes?" and
+  listens for one utterance.
+- Speaker verification kicks in: if it's your voice → transcribe and
+  dispatch. If it's someone else → silent no-op.
+- Nothing is listening between presses. Zero background CPU/mic use.
+
+Change the combo in `config.toml`:
+
+```toml
+[hotkey]
+enabled = true
+combo   = "ctrl+alt+j"          # or "f9", "win+space", "ctrl+shift+space", …
+ack     = true                  # set false for completely silent activation
+```
+
+Startup greeting is now minimal — just **"Hello, Raul."** No date, no
+time, no formality. Suppress it entirely with `--no-greet`.
 
 Or **just double-click `launch.bat`** — it handles the venv and starts
 the assistant. Four Desktop shortcuts are provided:

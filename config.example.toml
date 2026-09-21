@@ -31,6 +31,14 @@ enabled = false                   # set true to always run in wake-word mode
 phrases = ["hey jarvis", "jarvis"]
 ack     = "Yes?"                  # what Jarvis says when it hears you
 
+[hotkey]
+# Push-to-talk mode. Registers a system-wide keyboard shortcut and
+# only listens while you use it — no always-on wake-word STT.
+# Requires `pip install keyboard`.
+enabled = true
+combo   = "ctrl+alt+j"          # any `keyboard` combo string works
+ack     = true                  # brief "Yes?" cue when activated
+
 [speaker]
 # Speaker verification — Jarvis only responds to your enrolled voiceprint.
 # Workflow:
