@@ -246,38 +246,77 @@ def _make_one_shot_listener(config: dict):
     stt = config.get("stt", {})
     try:
         r = sr.Recognizer()
-        r.pause_threshold = float(stt.get("pause_threshold", 0.7))
-        r.dynamic_energy_threshold = True
+        # End-of-phrase detection. `pause_threshold` is the amount of
+        # silence (in seconds) after speech that triggers "you're
+        # done". `non_speaking_duration` is an internal buffer of
+        # silence retained before / after the phrase and MUST be
+        # <= pause_threshold or the library gets confused.
+        pause = float(stt.get("pause_threshold", 0.5))
+        r.pause_threshold = pause
+        r.non_speaking_duration = float(stt.get("non_speaking_duration",
+                                                min(0.3, pause - 0.05)))
+
+        # Dynamic energy adaptation slows silence detection when the
+        # room gets noisy. Off by default now for one-shot mode; the
+        # calibration below establishes a good static floor.
+        r.dynamic_energy_threshold = bool(stt.get("dynamic_energy_threshold", False))
         floor = stt.get("energy_threshold")
         if floor is not None:
             r.energy_threshold = int(floor)
+
         idx = stt.get("mic_index")
         try:
             mic = sr.Microphone(device_index=idx) if idx is not None else sr.Microphone()
         except Exception:
             mic = sr.Microphone()
+
+        # Longer ambient calibration → more accurate silence floor.
+        calib = float(stt.get("ambient_calibration_seconds", 1.0))
         with mic as source:
-            r.adjust_for_ambient_noise(source, duration=0.6)
+            r.adjust_for_ambient_noise(source, duration=calib)
+        logging.info("[stt] listener ready: pause=%.2fs nsd=%.2fs "
+                     "energy=%.0f dyn=%s calib=%.1fs",
+                     r.pause_threshold, r.non_speaking_duration,
+                     r.energy_threshold, r.dynamic_energy_threshold, calib)
+
         langs = [stt.get("language", "en-US")] + list(stt.get("alt_languages", []) or [])
         return (r, mic, langs)
-    except Exception:
+    except Exception as exc:
+        logging.warning("failed to build one-shot listener: %s", exc)
         return None
 
 
 def _read_voice(listener, config: dict, speaker_verifier=None) -> str:
     import speech_recognition as sr
+    import time as _time
     r, mic, langs = listener
     stt = config.get("stt", {})
-    phrase_limit = float(stt.get("followup_time_limit", stt.get("phrase_time_limit", 8.0)))
+    phrase_limit = float(stt.get("followup_time_limit", stt.get("phrase_time_limit", 7.0)))
+    initial_timeout = float(stt.get("initial_speech_timeout", 5.0))
     print("(listening…)")
+    t0 = _time.monotonic()
     try:
         with mic as source:
-            audio = r.listen(source, timeout=6, phrase_time_limit=phrase_limit)
+            audio = r.listen(source, timeout=initial_timeout,
+                             phrase_time_limit=phrase_limit)
     except sr.WaitTimeoutError:
+        logging.info("[stt] no speech detected within %.1fs", initial_timeout)
         return ""
     except Exception as exc:
         logging.warning("voice input failed: %s", exc)
         return ""
+
+    # Duration of the captured phrase (sample_rate * width bytes/sec).
+    try:
+        secs = len(audio.frame_data) / (audio.sample_rate * audio.sample_width)
+    except Exception:
+        secs = -1
+    elapsed = _time.monotonic() - t0
+    hit_limit = secs >= phrase_limit - 0.1
+    logging.info("[stt] captured %.2fs of audio (wall=%.2fs%s)",
+                 secs, elapsed,
+                 " — HIT PHRASE_TIME_LIMIT, sentence-end not detected"
+                 if hit_limit else "")
 
     # Speaker gate — if a non-owner voice trips this session, drop it
     # silently. Fails-open when disabled/not enrolled.

@@ -81,6 +81,14 @@ timeout_seconds = 6.0
 history_size    = 5                   # exchanges kept for context ("and tomorrow?")
 
 [stt]
+# End-of-phrase detection tuning.
+#   pause_threshold        — seconds of silence that mean "you're done" (0.4-0.7)
+#   non_speaking_duration  — internal buffer, must be <= pause_threshold
+#   dynamic_energy_threshold — off for hotkey mode (static floor is better)
+#   ambient_calibration_seconds — one-time noise floor sample on startup
+#   phrase_time_limit / followup_time_limit — hard cutoff for a single utterance
+#   initial_speech_timeout — after hotkey, how long we wait for you to start
+
 # Speech-to-text tuning. Bump `energy_threshold` if Jarvis is picking up
 # ambient noise; lower it if it's ignoring you. Add / reorder
 # `alt_languages` if you mix in Spanish or French mid-sentence.
