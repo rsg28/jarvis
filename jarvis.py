@@ -80,6 +80,16 @@ DEFAULT_CONFIG = {
         "timeout_seconds": 6.0,
         "history_size": 5,
     },
+    "speaker": {
+        # Speaker verification. When enabled and a voiceprint has been
+        # enrolled (via `python enroll_voice.py`), Jarvis only responds
+        # to voices whose cosine similarity to the voiceprint clears the
+        # threshold. Non-owner utterances are silently dropped.
+        "enabled": False,
+        "voiceprint_path": "voiceprint.npy",
+        "threshold": 0.65,          # 0..1. Higher = stricter.
+        "sample_rate": 16000,
+    },
     "stt": {
         # Primary Google STT language, plus fallbacks tried when the primary
         # gives no hypothesis. Keep the primary matching your wake word.
@@ -279,7 +289,8 @@ def _read_voice(listener, config: dict) -> str:
 
 # ─────────────────────── wake listener factory ───────────────────────
 
-def _build_wake_listener(config, phrases, on_command, on_wake, pause_flag):
+def _build_wake_listener(config, phrases, on_command, on_wake, pause_flag,
+                         speaker_verifier=None):
     """Construct a WakeWordListener wired to the [stt] config block."""
     from wake import WakeWordListener
 
@@ -299,7 +310,32 @@ def _build_wake_listener(config, phrases, on_command, on_wake, pause_flag):
         fuzzy_threshold=float(stt.get("fuzzy_threshold", 0.78)),
         recalibrate_every_seconds=float(stt.get("recalibrate_every_seconds", 300.0)),
         mic_index=stt.get("mic_index"),
+        speaker_verifier=speaker_verifier,
     )
+
+
+def _build_speaker_verifier(config):
+    """Return a SpeakerVerifier if [speaker].enabled is true, else None."""
+    try:
+        from speaker import build_from_config
+    except Exception as exc:
+        logging.warning("speaker module unavailable: %s", exc)
+        return None
+    # Voiceprint sits next to the script by default so it survives cwd
+    # weirdness when Jarvis is launched from a shortcut / .vbs.
+    base_dir = Path(__file__).parent
+    verifier = build_from_config(config, base_dir=base_dir)
+    if verifier is None:
+        return None
+    if not verifier.enrolled:
+        print("[speaker] enabled but no voiceprint yet — run "
+              "`python enroll_voice.py` first. Falling back to open mode.")
+    elif not verifier.available:
+        print("[speaker] resemblyzer not installed — falling back to open mode.")
+    else:
+        print(f"[speaker] locked to owner voiceprint "
+              f"({verifier.voiceprint_path.name}, threshold {verifier.threshold})")
+    return verifier
 
 
 # ─────────────────────── loop drivers ───────────────────────
@@ -395,6 +431,7 @@ def run_ui_loop(config: dict, voice: Voice) -> int:
         on_command=_on_command,
         on_wake=_on_wake,
         pause_flag=listener_pause,
+        speaker_verifier=_build_speaker_verifier(config),
     )
     listener.start()
 
@@ -472,6 +509,7 @@ def run_wake_loop(config: dict, voice: Voice) -> int:
             on_command=_on_command,
             on_wake=_on_wake,
             pause_flag=pause,
+            speaker_verifier=_build_speaker_verifier(config),
         )
         listener.start()
     except Exception as exc:

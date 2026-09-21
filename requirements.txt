@@ -21,6 +21,21 @@ Pillow>=10.0             # screenshots (PIL.ImageGrab)
 sounddevice>=0.5         # low-latency mic stream for clap detection
 numpy>=1.26              # amplitude analysis
 
+# Speaker verification (only responds to enrolled voice) — optional.
+# Uncomment and install if you want it. Order matters on Windows:
+#   pip install torch --index-url https://download.pytorch.org/whl/cpu
+#   pip install webrtcvad-wheels
+#   pip install --no-deps resemblyzer
+#   pip install librosa Unidecode inflect
+# (The `webrtcvad-wheels` package ships prebuilt Windows binaries so you
+# don't need Microsoft C++ Build Tools.)
+# torch>=2.2
+# webrtcvad-wheels>=2.0.14
+# resemblyzer>=0.1.4
+# librosa>=0.10
+# Unidecode>=1.3
+# inflect>=7.0
+
 # TOML config on Python 3.10 and older
 tomli>=2.0; python_version < "3.11"
 PySide6>=6.6

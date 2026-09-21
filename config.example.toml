@@ -31,6 +31,20 @@ enabled = false                   # set true to always run in wake-word mode
 phrases = ["hey jarvis", "jarvis"]
 ack     = "Yes?"                  # what Jarvis says when it hears you
 
+[speaker]
+# Speaker verification — Jarvis only responds to your enrolled voiceprint.
+# Workflow:
+#   1) pip install torch resemblyzer sounddevice
+#   2) python enroll_voice.py         (records 5 clips, saves voiceprint.npy)
+#   3) enabled = true                 (this line)
+# `threshold` is cosine similarity, 0..1. 0.65 is a solid starting point
+# for a headset; try 0.55 for a laptop mic if it rejects you too often,
+# or 0.72 for stricter gating.
+enabled          = false
+voiceprint_path  = "voiceprint.npy"
+threshold        = 0.65
+sample_rate      = 16000
+
 [resolver]
 # Extra folders the `open`, `read`, and `find` commands should search on
 # top of the defaults (Desktop, Documents, Downloads, Start Menu, plus

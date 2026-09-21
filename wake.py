@@ -53,6 +53,7 @@ class WakeWordListener:
         fuzzy_threshold: float = 0.78,
         recalibrate_every_seconds: float = 300.0,
         mic_index: Optional[int] = None,
+        speaker_verifier=None,
     ) -> None:
         self.wake_phrases: List[str] = [p.lower().strip() for p in wake_phrases if p.strip()]
         self.on_command = on_command
@@ -67,6 +68,7 @@ class WakeWordListener:
         self.conversation_timeout = float(conversation_timeout)
         self.fuzzy_threshold = float(fuzzy_threshold)
         self.recalibrate_every_seconds = float(recalibrate_every_seconds)
+        self.speaker_verifier = speaker_verifier
 
         import speech_recognition as sr
         self._sr = sr
@@ -113,6 +115,27 @@ class WakeWordListener:
             )
         except Exception as exc:
             logging.warning("wake calibration failed: %s", exc)
+
+    # ────────────── speaker verification ──────────────
+    def _is_owner(self, audio) -> bool:
+        """Return True if speaker verification is off / not enrolled /
+        the audio matches the enrolled voiceprint. Fail-open on errors."""
+        v = self.speaker_verifier
+        if v is None or not v.enrolled or not v.available:
+            return True
+        try:
+            wav_bytes = audio.get_wav_data(convert_rate=v.sample_rate,
+                                           convert_width=2)
+        except Exception as exc:
+            logging.debug("speaker: could not export wav: %s", exc)
+            return True
+        ok, sim = v.is_owner(wav_bytes)
+        if ok:
+            logging.debug("speaker: accepted (sim=%.2f, thr=%.2f)",
+                          sim, v.threshold)
+        else:
+            print(f"[speaker] rejected non-owner voice (sim={sim:.2f} < {v.threshold:.2f})")
+        return ok
 
     def _maybe_recalibrate(self) -> None:
         if self.recalibrate_every_seconds <= 0:
@@ -207,6 +230,10 @@ class WakeWordListener:
                     break
 
             if trailing is None:
+                continue
+
+            # Speaker gate — reject strangers before we ack or dispatch.
+            if not self._is_owner(audio):
                 continue
 
             print(f"[wake] heard → {matched_text!r}")
@@ -310,6 +337,11 @@ class WakeWordListener:
                 if silent_rounds >= MAX_SILENT_ROUNDS:
                     print("[wake] too many empty rounds, back to wake mode")
                     return
+                continue
+
+            # Reject a stranger jumping into our conversation window.
+            if not self._is_owner(audio):
+                # Don't count as silent — just ignore this utterance.
                 continue
 
             text = candidates[0].strip()

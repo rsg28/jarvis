@@ -196,6 +196,48 @@ extra_roots = ["C:/Users/you/projects", "D:/vault"]
 read_max_bytes = 200000
 ```
 
+## Recognises your voice only
+
+Jarvis can be locked to a single speaker — yours. It uses Resemblyzer
+(a small pretrained speaker-embedding model) to compare every
+incoming utterance against a voiceprint you enroll once. Anyone else
+speaking near your machine (family, coworkers, YouTube in the
+background) is silently ignored, even if they say "hey Jarvis".
+
+One-time setup (Windows, no C++ build tools required):
+
+```powershell
+pip install torch --index-url https://download.pytorch.org/whl/cpu
+pip install webrtcvad-wheels          # prebuilt binaries for Windows
+pip install --no-deps resemblyzer      # skip source-only webrtcvad
+pip install librosa Unidecode inflect  # remaining resemblyzer deps
+python enroll_voice.py                 # records 5 short clips of your voice
+```
+
+Linux / macOS users can just `pip install torch resemblyzer` — the
+`webrtcvad` source install works fine outside Windows.
+
+Then flip the switch in `config.toml`:
+
+```toml
+[speaker]
+enabled          = true
+voiceprint_path  = "voiceprint.npy"
+threshold        = 0.65              # 0..1. Higher = stricter.
+sample_rate      = 16000
+```
+
+Notes:
+
+- **Fail-open by default.** If `enabled=false`, or no voiceprint exists,
+  or Resemblyzer isn't installed, Jarvis behaves exactly like before.
+- **Silent rejection.** When a non-owner voice trips the wake word,
+  Jarvis says nothing — perfect for shared spaces.
+- **Tune the threshold** if it's too strict (rejects you) or too
+  permissive (lets in a housemate). Around 0.55–0.75 is typical.
+- **Re-enroll** any time your voice changes noticeably (cold, mic
+  swap, new headset) by rerunning `enroll_voice.py`.
+
 ## Natural language (LLM fallback)
 
 Out of the box Jarvis matches commands with a regex table. That's fast
