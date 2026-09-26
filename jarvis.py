@@ -286,7 +286,8 @@ def _make_one_shot_listener(config: dict):
         return None
 
 
-def _read_voice(listener, config: dict, speaker_verifier=None) -> str:
+def _read_voice(listener, config: dict, speaker_verifier=None,
+                whisper=None) -> str:
     import speech_recognition as sr
     import time as _time
     r, mic, langs = listener
@@ -335,7 +336,20 @@ def _read_voice(listener, config: dict, speaker_verifier=None) -> str:
         except Exception as exc:
             logging.warning("speaker verification failed on one-shot audio: %s", exc)
 
-    # Try each language in order; take the first hypothesis we get.
+    # ── Whisper (local, high accuracy) first, if available ──
+    if whisper is not None and whisper.available:
+        res = whisper.transcribe_audio(audio)
+        if res and res.get("text"):
+            text = res["text"].strip()
+            logging.info("[stt whisper %s] you > %s", res.get("language", "?"), text)
+            try:
+                print(f"you › {text}")
+            except Exception:
+                pass
+            return text
+        logging.info("[whisper] empty transcript; falling back to Google STT")
+
+    # ── Google STT fallback ──
     tried = []
     for lang in langs:
         try:
@@ -392,6 +406,27 @@ def _build_wake_listener(config, phrases, on_command, on_wake, pause_flag,
         mic_index=stt.get("mic_index"),
         speaker_verifier=speaker_verifier,
     )
+
+
+def _build_whisper(config):
+    """Return a WhisperBackend if [stt].engine = 'whisper', else None.
+    Preloads the model on the calling thread so the first hotkey
+    activation isn't blocked by a first-run 5-second model load."""
+    try:
+        from stt import build_from_config
+    except Exception as exc:
+        logging.warning("stt module unavailable: %s", exc)
+        return None
+    backend = build_from_config(config)
+    if backend is None:
+        return None
+    logging.info("[stt] loading Whisper model (%s) — may download on first run…",
+                 backend.model_size)
+    if backend.load():
+        print(f"[stt] Whisper ready ({backend.model_size} on {backend.device})")
+    else:
+        print("[stt] Whisper not available — falling back to Google STT")
+    return backend
 
 
 def _build_speaker_verifier(config):
@@ -644,6 +679,7 @@ def run_hotkey_loop(config: dict, voice: Voice) -> int:
 
     dispatcher = CommandDispatcher(config=config, voice=voice)
     speaker_verifier = _build_speaker_verifier(config)
+    whisper = _build_whisper(config)
     hotkey_cfg = config.get("hotkey", {})
     combo = hotkey_cfg.get("combo", "ctrl+alt+j")
     ack_enabled = bool(hotkey_cfg.get("ack", True))
@@ -683,7 +719,8 @@ def run_hotkey_loop(config: dict, voice: Voice) -> int:
             except Exception as exc:
                 logging.warning("voice ack failed: %s", exc)
         try:
-            text = _read_voice(listener, config, speaker_verifier=speaker_verifier)
+            text = _read_voice(listener, config, speaker_verifier=speaker_verifier,
+                               whisper=whisper)
         except Exception as exc:
             logging.exception("hotkey listen failed: %s", exc)
             return

@@ -24,6 +24,9 @@ numpy>=1.26              # amplitude analysis
 # Global hotkey (push-to-talk mode)
 keyboard>=0.13           # system-wide keyboard shortcuts, no admin needed
 
+# Local Whisper STT (much better than Google, offline, multilingual)
+faster-whisper>=1.0      # ctranslate2-based Whisper, real-time on CPU
+
 # Speaker verification (only responds to enrolled voice) — optional.
 # Uncomment and install if you want it. Order matters on Windows:
 #   pip install torch --index-url https://download.pytorch.org/whl/cpu

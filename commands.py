@@ -344,6 +344,37 @@ class CommandDispatcher:
             msg = f"Screenshot failed: {exc}"
         return CommandResult(speak="Screenshot saved to your desktop.", print_out=f"[jarvis] {msg}")
 
+    # ────────────── new: see / read the screen (Gemini vision) ──────────────
+    def _see_screen(self, prompt: str) -> CommandResult:
+        """Capture the primary display and ask Gemini about it.
+        Works for: describing what's visible, reading on-screen text,
+        translating foreign UIs, explaining code/errors, summarising
+        articles, etc."""
+        if self._llm is None:
+            return CommandResult(
+                speak="Vision needs the language model enabled. "
+                      "Turn on the L L M section in config first.",
+                print_out="[vision] LLM not configured — set [llm].enabled=true",
+            )
+        try:
+            from vision import describe_screen
+        except Exception as exc:
+            return CommandResult(
+                speak="Vision module could not load.",
+                print_out=f"[vision] import failed: {exc}",
+            )
+        # A blank prompt just asks "what's on screen"; anything else
+        # (translate this, what does this error mean, summarise the
+        # article, etc.) is passed through verbatim.
+        prompt = (prompt or "").strip() or "Describe what is on my screen right now."
+        reply = describe_screen(prompt, self._llm)
+        if not reply:
+            return CommandResult(
+                speak="I couldn't read the screen. Check the log for details.",
+                print_out="[vision] no reply from Gemini",
+            )
+        return CommandResult(speak=reply, print_out=f"[vision] {reply}")
+
     # ────────────── new: jokes / trivia ──────────────
     def _joke(self, _match) -> CommandResult:
         import fun as fun_mod
@@ -613,6 +644,31 @@ INTENTS: list[tuple[str, Callable[["CommandDispatcher", re.Match], CommandResult
     # Screenshot
     (r"^(?:screenshot|screen\s+shot|capture\s+screen|take\s+a\s+screenshot)$",
      lambda d, m: d._screenshot(m)),
+
+    # Screen vision — "what's on my screen", "read my screen",
+    # "describe the screen", "que hay en la pantalla",
+    # "what does the error say", etc. The optional `<prompt>` capture
+    # forwards anything after the trigger phrase as extra context.
+    (r"^(?:what.?s\s+on\s+(?:my\s+|the\s+)?(?:screen|monitor|pantalla)"
+     r"|what\s+do\s+i\s+see"
+     r"|describe\s+(?:my\s+|the\s+)?(?:screen|monitor|display|pantalla)"
+     r"|read\s+(?:my\s+|the\s+)?(?:screen|monitor|pantalla)"
+     r"|look\s+at\s+(?:my\s+|the\s+)?(?:screen|monitor|pantalla)"
+     r"|see\s+(?:my\s+|the\s+)?(?:screen|monitor|pantalla)"
+     r"|qu[eé]\s+(?:hay|se\s+ve|dice)\s+en\s+(?:mi\s+|la\s+)?pantalla"
+     r"|mira\s+(?:mi\s+|la\s+)?pantalla)"
+     r"(?:\s+(?P<prompt>.+))?\s*\??$",
+     lambda d, m: d._see_screen(m.group("prompt") or "")),
+
+    # Follow-up style: "what does this say", "translate this",
+    # "explain this error" — all read the current screen with the
+    # question as the prompt.
+    (r"^(?:what\s+does\s+this\s+(?:say|mean|show)"
+     r"|translate\s+this"
+     r"|explain\s+this(?:\s+(?:error|code|screen))?"
+     r"|summarize\s+this"
+     r"|summarise\s+this)\s*\??$",
+     lambda d, m: d._see_screen(m.group(0))),
 
     # Timers / Pomodoro / Reminders
     (r"^(?:set\s+(?:a\s+)?timer(?:\s+for)?\s+|timer\s+)(?P<dur>.+)$",

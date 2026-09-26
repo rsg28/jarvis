@@ -81,6 +81,16 @@ timeout_seconds = 6.0
 history_size    = 5                   # exchanges kept for context ("and tomorrow?")
 
 [stt]
+# STT engine. Options:
+#   "whisper" — local faster-whisper (offline, best accuracy)
+#   "google"  — free Google STT (needs internet, per-language)
+engine                      = "whisper"
+whisper_model               = "base"    # tiny|base|small|medium|large-v3
+whisper_device              = "cpu"     # or "cuda" for NVIDIA GPU
+whisper_compute_type        = "int8"
+whisper_language            = ""        # "" = auto-detect
+whisper_beam_size           = 1
+
 # End-of-phrase detection tuning.
 #   pause_threshold        — seconds of silence that mean "you're done" (0.4-0.7)
 #   non_speaking_duration  — internal buffer, must be <= pause_threshold

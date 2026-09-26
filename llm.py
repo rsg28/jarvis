@@ -57,7 +57,11 @@ Prefer these EXACT phrasings when you emit `call_intent`:
   scores [<league or team>]      la liga | premier | champions | mls | serie a | bundesliga | ligue 1 | peru | libertadores | europa
   battery | cpu | ram | disk | ip | wifi
   volume up [<n>] | volume down [<n>] | mute | set volume <0-100> | volume
-  screenshot
+  screenshot                     save a PNG of the screen to Desktop
+  read my screen | what's on my screen | describe my screen
+                                 → send screen to Gemini vision, speak reply
+  what does this say | translate this | explain this error
+                                 → same, with the follow-up as prompt
   set a timer for <duration>     e.g. "set a timer for 25 minutes"
   pomodoro
   remind me in <duration> to <task>
