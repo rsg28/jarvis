@@ -319,20 +319,28 @@ def _read_voice(listener, config: dict, speaker_verifier=None,
                  " — HIT PHRASE_TIME_LIMIT, sentence-end not detected"
                  if hit_limit else "")
 
-    # Speaker gate — if a non-owner voice trips this session, drop it
-    # silently. Fails-open when disabled/not enrolled.
+    # Speaker gate — verify identity against enrolled voiceprint.
+    # Two modes controlled by `[speaker].on_reject`:
+    #   "drop"    → silently ignore non-owner voices (strict; can block
+    #              you when your voice varies vs the enrollment mic).
+    #   "log"     → log the score but always process the command
+    #              (advisory; safer default in hotkey mode since the
+    #              hotkey itself is the security boundary).
     if speaker_verifier is not None and speaker_verifier.enrolled and speaker_verifier.available:
         try:
             wav_bytes = audio.get_wav_data(convert_rate=speaker_verifier.sample_rate,
                                            convert_width=2)
             ok, sim = speaker_verifier.is_owner(wav_bytes)
+            on_reject = (config.get("speaker", {}).get("on_reject") or "log").lower()
             if not ok:
-                # INFO (not debug) so the reason for silent no-ops is
-                # always visible in jarvis.log.
-                logging.info("[speaker] rejected (sim=%.2f < %.2f)",
+                if on_reject == "drop":
+                    logging.info("[speaker] REJECTED (sim=%.2f < %.2f) — dropping",
+                                 sim, speaker_verifier.threshold)
+                    return ""
+                logging.info("[speaker] low-score (sim=%.2f < %.2f) — processing anyway",
                              sim, speaker_verifier.threshold)
-                return ""
-            logging.info("[speaker] accepted (sim=%.2f)", sim)
+            else:
+                logging.info("[speaker] accepted (sim=%.2f)", sim)
         except Exception as exc:
             logging.warning("speaker verification failed on one-shot audio: %s", exc)
 
@@ -684,6 +692,33 @@ def run_hotkey_loop(config: dict, voice: Voice) -> int:
     combo = hotkey_cfg.get("combo", "ctrl+alt+j")
     ack_enabled = bool(hotkey_cfg.get("ack", True))
 
+    # Optional floating status indicator. Runs in the main-thread
+    # QApplication; callbacks push state changes via thread-safe signals.
+    ind_cfg = config.get("indicator", {}) or {}
+    indicator = None
+    qt_app = None
+    if ind_cfg.get("enabled", True):
+        try:
+            from PySide6.QtWidgets import QApplication
+            from indicator import create_indicator
+            qt_app = QApplication.instance() or QApplication([])
+            qt_app.setQuitOnLastWindowClosed(False)
+            indicator = create_indicator(
+                size=int(ind_cfg.get("size", 22)),
+                corner=str(ind_cfg.get("corner", "bottom-right")),
+                margin=int(ind_cfg.get("margin", 24)),
+            )
+        except Exception as exc:
+            logging.warning("indicator disabled: %s", exc)
+            indicator = None
+
+    def _ind(state: str) -> None:
+        if indicator is not None:
+            try:
+                indicator.set_state(state)
+            except Exception:
+                pass
+
     # One-shot listener is heavy to construct (ambient-noise calibration
     # opens the mic for ~600 ms); build it lazily on first press so
     # process startup stays fast.
@@ -709,8 +744,10 @@ def run_hotkey_loop(config: dict, voice: Voice) -> int:
 
     def _on_hotkey() -> None:
         _safe_print(f"[hotkey] {combo} pressed — listening…")
+        _ind("listening")
         listener = _ensure_listener()
         if listener is None:
+            _ind("error")
             _safe_print("[hotkey] voice input unavailable (SpeechRecognition/pyaudio missing).")
             return
         if ack_enabled:
@@ -723,18 +760,25 @@ def run_hotkey_loop(config: dict, voice: Voice) -> int:
                                whisper=whisper)
         except Exception as exc:
             logging.exception("hotkey listen failed: %s", exc)
+            _ind("error")
             return
         if not text:
             _safe_print("[hotkey] no command captured (empty or rejected)")
+            _ind("idle")
             return
         try:
+            _ind("thinking")
             result = dispatcher.dispatch(text)
             if result.speak:
+                _ind("speaking")
                 voice.say(result.speak)
             if result.print_out:
                 _safe_print(result.print_out)
         except Exception as exc:
             logging.exception("dispatch failed: %s", exc)
+            _ind("error")
+        finally:
+            _ind("idle")
 
     hotkey = HotkeyListener(combo, _on_hotkey)
     if not hotkey.start():
@@ -744,7 +788,13 @@ def run_hotkey_loop(config: dict, voice: Voice) -> int:
     print(f"\n=== JARVIS · armed ===")
     print(f"Press {combo.upper()} from any app to talk. Ctrl+C to quit.\n")
     try:
-        hotkey.wait_forever()
+        if qt_app is not None:
+            # Run the Qt event loop on the main thread so the indicator
+            # can repaint / animate. The hotkey message pump lives on
+            # its own thread and pushes state changes via Qt signals.
+            qt_app.exec()
+        else:
+            hotkey.wait_forever()
     except KeyboardInterrupt:
         print("\n[jarvis] shutting down.")
     finally:

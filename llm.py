@@ -57,6 +57,10 @@ Prefer these EXACT phrasings when you emit `call_intent`:
   scores [<league or team>]      la liga | premier | champions | mls | serie a | bundesliga | ligue 1 | peru | libertadores | europa
   battery | cpu | ram | disk | ip | wifi
   volume up [<n>] | volume down [<n>] | mute | set volume <0-100> | volume
+  type <text>                    type <text> into the focused window.
+                                 Snippet form: "type my email" uses config.
+  type my email | type my name | type my phone | type my address | type my github
+  press <key>                    e.g. "press enter", "press tab", "press ctrl+a"
   screenshot                     save a PNG of the screen to Desktop
   read my screen | what's on my screen | describe my screen
                                  → send screen to Gemini vision, speak reply

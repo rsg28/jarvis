@@ -107,6 +107,9 @@ class _Win32HotkeyThread(threading.Thread):
         self._register_error: Optional[str] = None
         self._thread_id: Optional[int] = None
         self._hotkey_id = 1
+        # Single-slot lock: only one active hotkey callback at a time.
+        # Non-blocking acquire in the message pump drops rapid presses.
+        self._active_lock = threading.Lock()
 
     def run(self) -> None:
         import ctypes
@@ -139,20 +142,68 @@ class _Win32HotkeyThread(threading.Thread):
                      "(mods=0x%04x, vk=0x%02x)", self.combo, mods & 0xFF, vk)
         self._registered.set()
 
-        # Message pump.
+        # Message pump. We do NOT run the callback inline — that would
+        # block the pump and Windows would spool up subsequent
+        # WM_HOTKEY messages while we're busy, causing a flood of
+        # activations when the callback finally returns.
+        # Instead: hand each press to a worker thread through a
+        # single-slot "active" flag. Presses while active are dropped.
         msg = wintypes.MSG()
         while True:
             ret = user32.GetMessageW(ctypes.byref(msg), None, 0, 0)
             if ret == 0 or ret == -1:
                 break  # WM_QUIT or error
             if msg.message == self.WM_HOTKEY:
-                logging.info("hotkey pressed: %s", self.combo)
-                try:
-                    self.callback()
-                except Exception:
-                    logging.exception("hotkey callback crashed")
+                self._fire_async()
             user32.TranslateMessage(ctypes.byref(msg))
             user32.DispatchMessageW(ctypes.byref(msg))
+
+    def _fire_async(self) -> None:
+        """Called from the message pump thread. Returns immediately."""
+        # Try to acquire the single-slot lock.
+        acquired = False
+        try:
+            acquired = self._active_lock.acquire(blocking=False)
+        except AttributeError:
+            pass  # first-time init below
+        if not acquired:
+            logging.info("hotkey ignored: %s (already active — finish current command first)",
+                         self.combo)
+            return
+        logging.info("hotkey pressed: %s", self.combo)
+
+        def _worker():
+            try:
+                self.callback()
+            except Exception:
+                logging.exception("hotkey callback crashed")
+            finally:
+                # Drain any queued WM_HOTKEY presses that piled up
+                # during the callback so they don't fire one-by-one
+                # on the next iteration of the pump.
+                self._drain_pending_hotkeys()
+                self._active_lock.release()
+
+        threading.Thread(target=_worker, daemon=True, name="HotkeyWorker").start()
+
+    def _drain_pending_hotkeys(self) -> None:
+        """Remove any WM_HOTKEY messages that queued up while the
+        worker was busy, so the pump doesn't re-fire immediately."""
+        try:
+            import ctypes
+            from ctypes import wintypes
+        except Exception:
+            return
+        user32 = ctypes.windll.user32
+        PM_REMOVE = 0x0001
+        msg = wintypes.MSG()
+        drained = 0
+        # PeekMessage(hWnd=NULL, filterMin=WM_HOTKEY, filterMax=WM_HOTKEY)
+        while user32.PeekMessageW(ctypes.byref(msg), None,
+                                   self.WM_HOTKEY, self.WM_HOTKEY, PM_REMOVE):
+            drained += 1
+        if drained:
+            logging.info("hotkey drained %d queued press(es)", drained)
 
         try:
             user32.UnregisterHotKey(None, self._hotkey_id)
@@ -227,26 +278,30 @@ class _KeyboardBackend:
 class HotkeyListener:
     def __init__(self, combo: str, on_trigger: Callable[[], None]) -> None:
         self.combo = combo
-        self._callback = self._wrap(on_trigger)
+        # No wrapper needed — the Win32 backend already guards single-slot
+        # execution AND drains queued presses. The keyboard-package
+        # fallback below wraps the callback with its own guard.
+        self._callback = on_trigger
         self._backend = None            # "win32" or "keyboard"
         self._win32_thread: Optional[_Win32HotkeyThread] = None
         self._kb_backend: Optional[_KeyboardBackend] = None
-        self._firing = False
-        self._fire_lock = threading.Lock()
+        self._kb_firing = False
+        self._kb_fire_lock = threading.Lock()
 
-    def _wrap(self, cb: Callable[[], None]) -> Callable[[], None]:
-        """Re-entrancy guard so machine-gunning the combo doesn't stack."""
+    def _kb_guarded_callback(self) -> Callable[[], None]:
+        """Re-entrancy guard specifically for the keyboard-package
+        fallback backend (which runs the callback synchronously)."""
         def _guarded() -> None:
-            with self._fire_lock:
-                if self._firing:
-                    logging.debug("hotkey: already handling a press, ignoring")
+            with self._kb_fire_lock:
+                if self._kb_firing:
+                    logging.info("hotkey ignored (already active)")
                     return
-                self._firing = True
+                self._kb_firing = True
             try:
-                cb()
+                self._callback()
             finally:
-                with self._fire_lock:
-                    self._firing = False
+                with self._kb_fire_lock:
+                    self._kb_firing = False
         return _guarded
 
     def start(self) -> bool:
@@ -262,7 +317,7 @@ class HotkeyListener:
             logging.warning("Win32 hotkey failed: %s. Falling back to `keyboard`.",
                             t._register_error)  # noqa: SLF001
 
-        kb = _KeyboardBackend(self.combo, self._callback)
+        kb = _KeyboardBackend(self.combo, self._kb_guarded_callback())
         if kb.start():
             self._kb_backend = kb
             self._backend = "keyboard"

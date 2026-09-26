@@ -344,6 +344,65 @@ class CommandDispatcher:
             msg = f"Screenshot failed: {exc}"
         return CommandResult(speak="Screenshot saved to your desktop.", print_out=f"[jarvis] {msg}")
 
+    # ────────────── new: type text on the user's behalf ──────────────
+    def _type_text(self, text: str) -> CommandResult:
+        """Type `text` into whatever window currently has focus.
+        Supports snippet substitution: `type my email` uses
+        config[snippets][email] if present. `text` is used literally
+        otherwise. Adds a small delay before typing so the user has
+        time to release the hotkey combo (otherwise the trailing
+        modifier keys would be pressed WHILE we type)."""
+        text = (text or "").strip()
+        if not text:
+            return CommandResult(speak="Type what?", print_out="[type] no text given")
+
+        # Snippet substitution: `type my email`, `type email` -> config value.
+        snippets = self.config.get("snippets", {}) or {}
+        key = text.lower().strip()
+        for candidate in (key, key.removeprefix("my ").strip()):
+            if candidate in snippets:
+                text = str(snippets[candidate])
+                logging.info("[type] snippet %r -> %r", candidate, text[:60])
+                break
+
+        try:
+            import keyboard
+            import time as _time
+            # Small delay so the Ctrl+Shift+Space modifiers we're
+            # holding at the moment of activation are released before
+            # we start injecting keystrokes.
+            _time.sleep(0.35)
+            keyboard.write(text, delay=0.01)
+        except Exception as exc:
+            return CommandResult(
+                speak="I can't type right now.",
+                print_out=f"[type] failed: {exc}",
+            )
+        preview = text if len(text) <= 60 else text[:57] + "..."
+        return CommandResult(print_out=f"[type] wrote {len(text)} chars: {preview}")
+
+    def _press_key(self, combo: str) -> CommandResult:
+        """Press a single key or combo like 'enter', 'tab', 'ctrl+a'."""
+        combo = (combo or "").strip().lower()
+        if not combo:
+            return CommandResult(speak="Press what?", print_out="[press] no key")
+        # Normalise common voice-transcribed variants.
+        combo = (combo
+                 .replace(" plus ", "+")
+                 .replace(" and ", "+")
+                 .replace(" ", "+"))
+        try:
+            import keyboard
+            import time as _time
+            _time.sleep(0.25)
+            keyboard.press_and_release(combo)
+        except Exception as exc:
+            return CommandResult(
+                speak="I can't send that key.",
+                print_out=f"[press] {combo!r} failed: {exc}",
+            )
+        return CommandResult(print_out=f"[press] {combo}")
+
     # ────────────── new: see / read the screen (Gemini vision) ──────────────
     def _see_screen(self, prompt: str) -> CommandResult:
         """Capture the primary display and ask Gemini about it.
@@ -644,6 +703,19 @@ INTENTS: list[tuple[str, Callable[["CommandDispatcher", re.Match], CommandResult
     # Screenshot
     (r"^(?:screenshot|screen\s+shot|capture\s+screen|take\s+a\s+screenshot)$",
      lambda d, m: d._screenshot(m)),
+
+    # Type text into the focused window. Snippet substitution:
+    # `type my email` -> config[snippets][email].
+    (r"^(?:type|write|escribe|escribir)\s+(?P<t>.+)$",
+     lambda d, m: d._type_text(m.group("t"))),
+
+    # Press a single key or combo: `press enter`, `press tab`, `press ctrl a`.
+    (r"^(?:press|hit|pulsa|presiona)\s+(?P<k>[a-z0-9 +]+?)\s*(?:key)?$",
+     lambda d, m: d._press_key(m.group("k"))),
+    # Shorthand: bare key words.
+    (r"^(?:enter|return|tab|escape|esc|backspace|delete|space|home|end|"
+     r"page\s+up|page\s+down|up|down|left|right)$",
+     lambda d, m: d._press_key(m.group(0))),
 
     # Screen vision — "what's on my screen", "read my screen",
     # "describe the screen", "que hay en la pantalla",
