@@ -46,6 +46,9 @@ class Voice:
         self.address = (address or "").strip()
         self._edge_ready = False
         self._sapi = None
+        # Flipped by stop() to break out of the pygame wait loop from
+        # another thread (used by the hotkey to interrupt mid-sentence).
+        self._stopping = False
 
         if not enabled:
             return
@@ -117,9 +120,30 @@ class Voice:
             self._sapi = None
 
     # ────────────── public API ──────────────
+    def stop(self) -> None:
+        """Halt any currently-playing speech immediately. Safe to call
+        from any thread. No-op if nothing is playing. Used by the
+        hotkey listener so a fresh Ctrl+Shift+Space cuts Jarvis off
+        mid-sentence and starts listening for the new command."""
+        self._stopping = True
+        try:
+            import pygame
+            if pygame.mixer.get_init() and pygame.mixer.music.get_busy():
+                pygame.mixer.music.stop()
+        except Exception as exc:
+            logging.debug("voice stop (pygame) failed: %s", exc)
+        try:
+            if self._sapi is not None:
+                self._sapi.stop()
+        except Exception as exc:
+            logging.debug("voice stop (SAPI) failed: %s", exc)
+
     def say(self, text: str) -> None:
         if not self.enabled or not text:
             return
+        # Reset the interrupt flag for this fresh utterance so a stale
+        # stop() from a previous run doesn't kill the new one.
+        self._stopping = False
 
         # Trim excess whitespace but keep punctuation for natural prosody.
         text = " ".join(text.split())
@@ -165,8 +189,12 @@ class Voice:
             asyncio.run(_synth(path))
             pygame.mixer.music.load(path)
             pygame.mixer.music.play()
+            # Poll for end-of-playback OR external stop().
             while pygame.mixer.music.get_busy():
-                pygame.time.wait(60)
+                if self._stopping:
+                    pygame.mixer.music.stop()
+                    break
+                pygame.time.wait(50)
             pygame.mixer.music.unload()
         finally:
             try:

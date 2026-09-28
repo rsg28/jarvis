@@ -25,6 +25,11 @@ import platform
 import threading
 from typing import Callable, Optional, Tuple
 
+# Callback signature is `on_trigger(cancel: threading.Event) -> None`.
+# The callback should check `cancel.is_set()` between long phases and
+# bail early when the user has pressed the hotkey again.
+CancelCallback = Callable[[threading.Event], None]
+
 
 # ─────────────────────── combo parser ───────────────────────
 # Windows virtual-key codes for common non-alphanumeric keys.
@@ -98,18 +103,24 @@ class _Win32HotkeyThread(threading.Thread):
     WM_HOTKEY = 0x0312
     WM_QUIT   = 0x0012
 
-    def __init__(self, combo: str, callback: Callable[[], None]) -> None:
+    def __init__(self, combo: str, callback: CancelCallback,
+                 interrupt_hook: Optional[Callable[[], None]] = None) -> None:
         super().__init__(name=f"Win32Hotkey-{combo}", daemon=True)
         self.combo = combo
         self.callback = callback
+        # Called from the hotkey thread when a fresh press arrives while
+        # an activation is still running. Use it to abort audio playback,
+        # cancel a network request, etc. Must return quickly.
+        self.interrupt_hook = interrupt_hook
         self._registered = threading.Event()
         self._register_ok = False
         self._register_error: Optional[str] = None
         self._thread_id: Optional[int] = None
         self._hotkey_id = 1
-        # Single-slot lock: only one active hotkey callback at a time.
-        # Non-blocking acquire in the message pump drops rapid presses.
-        self._active_lock = threading.Lock()
+        # State for the interrupt-and-restart flow.
+        self._state_lock = threading.Lock()
+        self._current_worker: Optional[threading.Thread] = None
+        self._current_cancel: Optional[threading.Event] = None
 
     def run(self) -> None:
         import ctypes
@@ -159,32 +170,57 @@ class _Win32HotkeyThread(threading.Thread):
             user32.DispatchMessageW(ctypes.byref(msg))
 
     def _fire_async(self) -> None:
-        """Called from the message pump thread. Returns immediately."""
-        # Try to acquire the single-slot lock.
-        acquired = False
-        try:
-            acquired = self._active_lock.acquire(blocking=False)
-        except AttributeError:
-            pass  # first-time init below
-        if not acquired:
-            logging.info("hotkey ignored: %s (already active — finish current command first)",
-                         self.combo)
-            return
-        logging.info("hotkey pressed: %s", self.combo)
+        """Called from the message pump thread when WM_HOTKEY arrives.
+        Semantics: a press ALWAYS wins — if an activation is currently
+        running, we interrupt it (stop audio, signal cancel, brief join)
+        and start a fresh one. The user gets to override Jarvis mid-
+        sentence just by pressing again."""
+        prev_worker: Optional[threading.Thread] = None
+        with self._state_lock:
+            if (self._current_worker is not None
+                    and self._current_worker.is_alive()):
+                prev_worker = self._current_worker
+                if self._current_cancel is not None:
+                    self._current_cancel.set()
+                logging.info("hotkey pressed: %s (interrupting previous run)",
+                             self.combo)
+            else:
+                logging.info("hotkey pressed: %s", self.combo)
+
+        # Interrupt hook lives outside the lock — it may call back into
+        # audio libraries that take their own locks.
+        if prev_worker is not None and self.interrupt_hook is not None:
+            try:
+                self.interrupt_hook()
+            except Exception:
+                logging.exception("interrupt hook failed")
+
+        # Give the previous worker a window to unwind cleanly. The
+        # speaking-phase interrupt returns almost instantly once
+        # voice.stop() halts pygame; the listening-phase needs longer
+        # because r.listen() is uncancellable and holds the mic until
+        # silence detection or phrase_time_limit fires.
+        if prev_worker is not None:
+            prev_worker.join(timeout=1.5)
+
+        # Fresh cancel event for the new run.
+        new_cancel = threading.Event()
 
         def _worker():
             try:
-                self.callback()
+                self.callback(new_cancel)
             except Exception:
                 logging.exception("hotkey callback crashed")
             finally:
-                # Drain any queued WM_HOTKEY presses that piled up
-                # during the callback so they don't fire one-by-one
-                # on the next iteration of the pump.
+                # Drain any WM_HOTKEY presses that queued during the
+                # callback so we don't rapid-fire on pump resume.
                 self._drain_pending_hotkeys()
-                self._active_lock.release()
 
-        threading.Thread(target=_worker, daemon=True, name="HotkeyWorker").start()
+        t = threading.Thread(target=_worker, daemon=True, name="HotkeyWorker")
+        with self._state_lock:
+            self._current_worker = t
+            self._current_cancel = new_cancel
+        t.start()
 
     def _drain_pending_hotkeys(self) -> None:
         """Remove any WM_HOTKEY messages that queued up while the
@@ -276,38 +312,63 @@ class _KeyboardBackend:
 
 # ─────────────────────── public facade ───────────────────────
 class HotkeyListener:
-    def __init__(self, combo: str, on_trigger: Callable[[], None]) -> None:
+    def __init__(self, combo: str, on_trigger: CancelCallback,
+                 interrupt_hook: Optional[Callable[[], None]] = None) -> None:
         self.combo = combo
-        # No wrapper needed — the Win32 backend already guards single-slot
-        # execution AND drains queued presses. The keyboard-package
-        # fallback below wraps the callback with its own guard.
+        # Callback receives a threading.Event that gets set when the
+        # next press arrives, so long-running work can bail early.
         self._callback = on_trigger
+        self._interrupt_hook = interrupt_hook
         self._backend = None            # "win32" or "keyboard"
         self._win32_thread: Optional[_Win32HotkeyThread] = None
         self._kb_backend: Optional[_KeyboardBackend] = None
-        self._kb_firing = False
-        self._kb_fire_lock = threading.Lock()
+        # Interrupt-and-restart state for the keyboard-package fallback.
+        self._kb_state_lock = threading.Lock()
+        self._kb_current_worker: Optional[threading.Thread] = None
+        self._kb_current_cancel: Optional[threading.Event] = None
 
     def _kb_guarded_callback(self) -> Callable[[], None]:
-        """Re-entrancy guard specifically for the keyboard-package
-        fallback backend (which runs the callback synchronously)."""
-        def _guarded() -> None:
-            with self._kb_fire_lock:
-                if self._kb_firing:
-                    logging.info("hotkey ignored (already active)")
-                    return
-                self._kb_firing = True
-            try:
-                self._callback()
-            finally:
-                with self._kb_fire_lock:
-                    self._kb_firing = False
-        return _guarded
+        """Interrupt-and-restart wrapper for the keyboard-package
+        fallback backend. Same semantics as the Win32 backend: a fresh
+        press cancels the previous run and starts a new one."""
+        def _fire() -> None:
+            prev_worker = None
+            with self._kb_state_lock:
+                if (self._kb_current_worker is not None
+                        and self._kb_current_worker.is_alive()):
+                    prev_worker = self._kb_current_worker
+                    if self._kb_current_cancel is not None:
+                        self._kb_current_cancel.set()
+                    logging.info("hotkey pressed (interrupting previous)")
+                else:
+                    logging.info("hotkey pressed")
+            if prev_worker is not None and self._interrupt_hook is not None:
+                try:
+                    self._interrupt_hook()
+                except Exception:
+                    logging.exception("interrupt hook failed")
+            if prev_worker is not None:
+                prev_worker.join(timeout=1.5)
+            new_cancel = threading.Event()
+
+            def _worker():
+                try:
+                    self._callback(new_cancel)
+                except Exception:
+                    logging.exception("hotkey callback crashed")
+
+            t = threading.Thread(target=_worker, daemon=True, name="HotkeyWorker-kb")
+            with self._kb_state_lock:
+                self._kb_current_worker = t
+                self._kb_current_cancel = new_cancel
+            t.start()
+        return _fire
 
     def start(self) -> bool:
         # Prefer Win32 on Windows — it's the OS-level, AV-friendly path.
         if platform.system() == "Windows":
-            t = _Win32HotkeyThread(self.combo, self._callback)
+            t = _Win32HotkeyThread(self.combo, self._callback,
+                                   interrupt_hook=self._interrupt_hook)
             t.start()
             if t.wait_registered(timeout=3.0):
                 self._win32_thread = t

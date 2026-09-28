@@ -742,7 +742,10 @@ def run_hotkey_loop(config: dict, voice: Voice) -> int:
         except Exception:
             pass
 
-    def _on_hotkey() -> None:
+    def _on_hotkey(cancel: "threading.Event") -> None:
+        """Runs on a worker thread. `cancel` is set by the hotkey
+        message pump when a NEW press arrives — we should stop what
+        we're doing and let the next activation take over."""
         _safe_print(f"[hotkey] {combo} pressed — listening…")
         _ind("listening")
         listener = _ensure_listener()
@@ -750,17 +753,28 @@ def run_hotkey_loop(config: dict, voice: Voice) -> int:
             _ind("error")
             _safe_print("[hotkey] voice input unavailable (SpeechRecognition/pyaudio missing).")
             return
-        if ack_enabled:
+        # If the previous voice output was still playing, it's been
+        # stopped by the interrupt hook already; reset the flag so
+        # this run's "Yes?" isn't cancelled by the stale stop().
+        if ack_enabled and not cancel.is_set():
             try:
                 voice.say("Yes?")
             except Exception as exc:
                 logging.warning("voice ack failed: %s", exc)
+        if cancel.is_set():
+            logging.info("[hotkey] cancelled before listen")
+            _ind("idle")
+            return
         try:
             text = _read_voice(listener, config, speaker_verifier=speaker_verifier,
                                whisper=whisper)
         except Exception as exc:
             logging.exception("hotkey listen failed: %s", exc)
             _ind("error")
+            return
+        if cancel.is_set():
+            logging.info("[hotkey] cancelled after listen (transcript=%r)", text[:60])
+            _ind("idle")
             return
         if not text:
             _safe_print("[hotkey] no command captured (empty or rejected)")
@@ -769,6 +783,10 @@ def run_hotkey_loop(config: dict, voice: Voice) -> int:
         try:
             _ind("thinking")
             result = dispatcher.dispatch(text)
+            if cancel.is_set():
+                logging.info("[hotkey] cancelled after dispatch, skipping speech")
+                _ind("idle")
+                return
             if result.speak:
                 _ind("speaking")
                 voice.say(result.speak)
@@ -780,7 +798,11 @@ def run_hotkey_loop(config: dict, voice: Voice) -> int:
         finally:
             _ind("idle")
 
-    hotkey = HotkeyListener(combo, _on_hotkey)
+    # `voice.stop` is the interrupt hook: called synchronously from the
+    # hotkey thread when a fresh Ctrl+Shift+Space arrives while Jarvis
+    # is still speaking. It halts pygame playback immediately so the
+    # user gets heard the moment they press.
+    hotkey = HotkeyListener(combo, _on_hotkey, interrupt_hook=voice.stop)
     if not hotkey.start():
         print("[jarvis] could not register global hotkey; falling back to text mode.")
         return run_text_or_oneshot(config, voice, use_voice=False)
