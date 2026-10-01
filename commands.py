@@ -266,9 +266,17 @@ class CommandDispatcher:
 
         api = sp_mod.api_from_config(self.config) if sp_mod else None
 
-        if api is not None and sp_mod is not None:
+        # Track WHY we're falling back so the spoken reply tells the
+        # user something actionable — not just "I opened a search page".
+        reason: Optional[str] = None
+
+        if api is None:
+            reason = "no_credentials"
+        elif sp_mod is not None:
             track = api.search_track(query)
-            if track and track.get("uri"):
+            if not track or not track.get("uri"):
+                reason = "no_match"
+            else:
                 auto_play = bool((self.config.get("spotify") or {})
                                  .get("auto_play", True))
                 ok = sp_mod.play_track(track["uri"], auto_play=auto_play)
@@ -278,18 +286,31 @@ class CommandDispatcher:
                         speak=f"Playing {label} on Spotify.",
                         print_out=f"[spotify] {track['uri']}  →  {label}",
                     )
-                # launch failed; fall through to web fallback
+                reason = "launch_failed"
 
-        # ── Fallback: no credentials, no network, or search found nothing ──
+        # ── Fallback: open the web search page with a spoken reason ──
         url = f"https://open.spotify.com/search/{urllib.parse.quote_plus(query)}"
         webbrowser.open(url)
-        hint = ""
-        if api is None:
-            hint = (" (Tip: add [spotify].client_id / client_secret to "
-                    "config.toml to play directly in the app.)")
+        if reason == "no_credentials":
+            speak = (f"I don't have Spotify credentials yet, so I can't play "
+                     f"inside the app. I opened the search for {query} in your "
+                     f"browser. Add your Spotify client id and secret to the "
+                     f"config to play directly from the app next time.")
+            print_tag = "[spotify] credentials missing"
+        elif reason == "no_match":
+            speak = (f"I couldn't find a track called {query} on Spotify. "
+                     f"I opened the search in your browser so you can pick one.")
+            print_tag = "[spotify] no track matched"
+        elif reason == "launch_failed":
+            speak = ("I found the track but couldn't launch the Spotify app. "
+                     "I opened the web search as a fallback.")
+            print_tag = "[spotify] desktop launch failed"
+        else:
+            speak = f"Looking up {query} on Spotify."
+            print_tag = "[jarvis] opened"
         return CommandResult(
-            speak=f"Looking up {query} on Spotify.",
-            print_out=f"[jarvis] opened {url}{hint}",
+            speak=speak,
+            print_out=f"{print_tag}  →  {url}",
         )
 
     def _time_now(self, _match) -> CommandResult:
