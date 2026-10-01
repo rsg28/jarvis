@@ -696,6 +696,9 @@ def run_hotkey_loop(config: dict, voice: Voice) -> int:
     # QApplication; callbacks push state changes via thread-safe signals.
     ind_cfg = config.get("indicator", {}) or {}
     indicator = None
+    chat_window = None
+    chat_corner = str(ind_cfg.get("corner", "bottom-right"))
+    chat_margin = int(ind_cfg.get("margin", 24))
     qt_app = None
     if ind_cfg.get("enabled", True):
         try:
@@ -705,8 +708,8 @@ def run_hotkey_loop(config: dict, voice: Voice) -> int:
             qt_app.setQuitOnLastWindowClosed(False)
             indicator = create_indicator(
                 size=int(ind_cfg.get("size", 22)),
-                corner=str(ind_cfg.get("corner", "bottom-right")),
-                margin=int(ind_cfg.get("margin", 24)),
+                corner=chat_corner,
+                margin=chat_margin,
             )
         except Exception as exc:
             logging.warning("indicator disabled: %s", exc)
@@ -718,6 +721,28 @@ def run_hotkey_loop(config: dict, voice: Voice) -> int:
                 indicator.set_state(state)
             except Exception:
                 pass
+
+    # ─── chat mode state ───
+    # When the chat window is open we suppress voice processing: the
+    # hotkey callback bails immediately and any in-flight audio is
+    # stopped. This gives the user a clean "typed mode" with no mic.
+    chat_mode = {"on": False}
+
+    def _chat_handle(text: str) -> str:
+        """Called from the chat window on its worker thread. Dispatches
+        the command through the same pipeline the voice path uses, but
+        returns the reply as a string instead of speaking it."""
+        try:
+            result = dispatcher.dispatch(text)
+        except Exception as exc:
+            logging.exception("chat dispatch failed")
+            return f"[error] {exc}"
+        parts = []
+        if result.speak:
+            parts.append(result.speak)
+        if result.print_out and result.print_out not in parts:
+            parts.append(result.print_out)
+        return "\n".join(parts) if parts else "(no reply)"
 
     # One-shot listener is heavy to construct (ambient-noise calibration
     # opens the mic for ~600 ms); build it lazily on first press so
@@ -746,6 +771,13 @@ def run_hotkey_loop(config: dict, voice: Voice) -> int:
         """Runs on a worker thread. `cancel` is set by the hotkey
         message pump when a NEW press arrives — we should stop what
         we're doing and let the next activation take over."""
+        # Chat mode suppresses voice input entirely — the user typed
+        # their way in, so we don't want to accidentally start listening
+        # to the room while they're reading a reply.
+        if chat_mode["on"]:
+            _safe_print("[hotkey] chat is open — voice input disabled")
+            logging.info("[hotkey] ignored: chat window is open")
+            return
         _safe_print(f"[hotkey] {combo} pressed — listening…")
         _ind("listening")
         listener = _ensure_listener()
@@ -803,6 +835,61 @@ def run_hotkey_loop(config: dict, voice: Voice) -> int:
     # is still speaking. It halts pygame playback immediately so the
     # user gets heard the moment they press.
     hotkey = HotkeyListener(combo, _on_hotkey, interrupt_hook=voice.stop)
+
+    # ─── orb click → open/close chat ───
+    def _toggle_chat() -> None:
+        nonlocal chat_window
+        # Hide: easy case, just hide and clear chat_mode.
+        if chat_window is not None and chat_window.isVisible():
+            chat_window.hide()
+            chat_mode["on"] = False
+            _ind("idle")
+            logging.info("[chat] closed")
+            return
+        # Open: cancel any in-flight voice activity first.
+        try:
+            voice.stop()
+        except Exception:
+            pass
+        # Build lazily on first click so startup stays fast.
+        if chat_window is None:
+            try:
+                from chat import create_chat
+                chat_window = create_chat(
+                    handler=_chat_handle,
+                    anchor_corner=chat_corner,
+                    anchor_margin=chat_margin,
+                )
+            except Exception as exc:
+                logging.warning("could not create chat window: %s", exc)
+                return
+        if chat_window is None:
+            return
+
+        # When the user closes the chat (× button, Esc), hideEvent runs;
+        # we hook it to clear chat_mode. Done once per lifetime.
+        if not getattr(chat_window, "_jarvis_hooked", False):
+            orig_hide = chat_window.hideEvent
+            def _on_hide(ev):
+                chat_mode["on"] = False
+                _ind("idle")
+                logging.info("[chat] closed (hideEvent)")
+                orig_hide(ev)
+            chat_window.hideEvent = _on_hide
+            chat_window._jarvis_hooked = True
+
+        chat_mode["on"] = True
+        _ind("thinking")  # subtle amber hint that chat is active
+        chat_window.show()
+        chat_window.activateWindow()
+        chat_window.raise_()
+        logging.info("[chat] opened")
+
+    if indicator is not None:
+        try:
+            indicator.clicked.connect(_toggle_chat)
+        except Exception as exc:
+            logging.warning("could not connect orb click: %s", exc)
     if not hotkey.start():
         print("[jarvis] could not register global hotkey; falling back to text mode.")
         return run_text_or_oneshot(config, voice, use_voice=False)

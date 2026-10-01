@@ -50,6 +50,7 @@ try:
 
     class _Signals(QObject):
         state_changed = Signal(str)
+        clicked = Signal()
 
     class Indicator(QWidget):
         STATE_COLORS = {
@@ -62,13 +63,19 @@ try:
 
         def __init__(self, size: int = 24, corner: str = "bottom-right",
                      margin: int = 24, parent=None) -> None:
+            # NOTE: dropped WindowTransparentForInput — we want the orb
+            # to catch clicks so the user can toggle the text chat.
+            # Keep WA_ShowWithoutActivating so Jarvis still doesn't
+            # steal keyboard focus just by refreshing the dot's state.
             super().__init__(parent,
                              Qt.FramelessWindowHint |
                              Qt.WindowStaysOnTopHint |
-                             Qt.Tool |
-                             Qt.WindowTransparentForInput)
+                             Qt.Tool)
             self.setAttribute(Qt.WA_TranslucentBackground)
             self.setAttribute(Qt.WA_ShowWithoutActivating)
+            # Cursor hint so people realise it's clickable.
+            self.setCursor(Qt.PointingHandCursor)
+            self.setToolTip("Click to open chat (Esc to close)")
             self._size = int(size)
             self._pad = max(6, self._size // 3)
             box = self._size + self._pad * 2
@@ -88,6 +95,7 @@ try:
             }
             x, y = positions.get(corner, positions["bottom-right"])
             self.move(int(x), int(y))
+            self._corner = corner  # exposed so the chat window can anchor
 
             self._state = "idle"
             self._pulse_phase = 0.0
@@ -102,6 +110,17 @@ try:
         # ── thread-safe public API ──
         def set_state(self, state: str) -> None:
             self._signals.state_changed.emit(state)
+
+        # Public signal pass-through so callers can connect click handler.
+        @property
+        def clicked(self):
+            return self._signals.clicked
+
+        def mousePressEvent(self, ev) -> None:
+            # Only left-click toggles the chat.
+            if ev.button() == Qt.LeftButton:
+                self._signals.clicked.emit()
+            super().mousePressEvent(ev)
 
         # ── internals ──
         def _on_state(self, state: str) -> None:
