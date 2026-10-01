@@ -42,23 +42,34 @@ _toaster = None
 _toaster_failed = False
 
 
-def _get_toaster():
+def _get_toaster(interactive: bool):
+    """Return a cached toaster. InteractableWindowsToaster supports
+    action buttons; the plain WindowsToaster is lighter and used when
+    no URL is attached. Both drop their toasts into the Action Center."""
     global _toaster, _toaster_failed
-    if _toaster is not None or _toaster_failed:
-        return _toaster
+    if _toaster_failed:
+        return None
+    if _toaster is not None and _toaster[0] is interactive:
+        return _toaster[1]
     try:
-        from windows_toasts import WindowsToaster  # type: ignore
-        _toaster = WindowsToaster("Jarvis")
+        if interactive:
+            from windows_toasts import InteractableWindowsToaster  # type: ignore
+            inst = InteractableWindowsToaster("Jarvis")
+        else:
+            from windows_toasts import WindowsToaster  # type: ignore
+            inst = WindowsToaster("Jarvis")
+        _toaster = (interactive, inst)
+        return inst
     except Exception as exc:
         logging.warning("[notify] toast backend unavailable: %s", exc)
         _toaster_failed = True
-    return _toaster
+        return None
 
 
 def send_toast(n: Notification) -> bool:
     """Fire a Windows Action Center toast. Clickable row + optional
-    'Open' button that fires the URL."""
-    toaster = _get_toaster()
+    'Open chapter' button when a URL is attached."""
+    toaster = _get_toaster(interactive=bool(n.url))
     if toaster is None:
         return False
     try:
@@ -66,8 +77,7 @@ def send_toast(n: Notification) -> bool:
         toast = Toast()
         toast.text_fields = [n.title, n.body]
         if n.url:
-            # Clicking the toast body itself = open the URL.
-            # Also add an explicit button for clarity.
+            # Clicking the toast row opens the URL (default browser).
             toast.launch_action = n.url
             toast.AddAction(ToastButton("Open chapter", n.url))
         toaster.show_toast(toast)
