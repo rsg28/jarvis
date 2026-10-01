@@ -539,6 +539,72 @@ class CommandDispatcher:
             )
         return CommandResult(speak=reply, print_out=f"[vision] {reply}")
 
+    # ────────────── new: manga watcher ──────────────
+    def _manga_check(self, _match) -> CommandResult:
+        """Run the configured manga watcher on demand."""
+        try:
+            import manga_watch as mw
+        except Exception as exc:
+            return CommandResult(
+                speak=f"The manga watcher module failed to load: {type(exc).__name__}.",
+                print_out=f"[manga] import failed: {exc}")
+        from pathlib import Path as _P
+        config_dir = _P(self.config.get("_config_dir", ".")).resolve()
+        drops = mw.check_all(self.config, config_dir)
+        if not drops:
+            # Pull last-seen numbers from the state file so we can tell
+            # the user what we DID find, instead of silence.
+            series = (self.config.get("manga", {}) or {}).get("series") or []
+            if not series:
+                return CommandResult(
+                    speak="You don't have any manga on your watchlist yet. "
+                          "Add one under the manga section in config.",
+                    print_out="[manga] no series configured")
+            try:
+                import json as _j
+                state = _j.loads((config_dir / "manga_state.json")
+                                 .read_text(encoding="utf-8"))
+                parts = [f"{v.get('name')} is at chapter {v.get('last_seen_chapter')}"
+                         for v in state.values() if v.get("last_seen_chapter")]
+                if parts:
+                    speak = "No new chapters. " + "; ".join(parts) + "."
+                else:
+                    speak = "No new chapters right now."
+            except Exception:
+                speak = "No new chapters right now."
+            return CommandResult(speak=speak, print_out=mw.summary_for_log(drops))
+        return CommandResult(
+            speak=mw.format_announcement(drops),
+            print_out=mw.summary_for_log(drops))
+
+    def _manga_latest(self, query: str) -> CommandResult:
+        """One-shot lookup: 'latest chapter of <series>'."""
+        query = (query or "").strip()
+        if not query:
+            return CommandResult(speak="Latest chapter of what?",
+                                 print_out="[manga] empty query")
+        try:
+            import manga_watch as mw
+        except Exception as exc:
+            return CommandResult(
+                speak=f"The manga module failed to load: {type(exc).__name__}.",
+                print_out=f"[manga] import failed: {exc}")
+        language = str((self.config.get("manga", {}) or {}).get("language", "en"))
+        hit = mw.latest_for_query(query, language=language)
+        if hit is None:
+            return CommandResult(
+                speak=f"I couldn't find anything called {query} on MangaDex.",
+                print_out=f"[manga] no match for {query!r}")
+        if not hit.get("chapter"):
+            return CommandResult(
+                speak=f"I found {hit['title']} but there are no translated "
+                      f"chapters yet.",
+                print_out=f"[manga] {hit['title']}: no chapters")
+        return CommandResult(
+            speak=f"The latest chapter of {hit['title']} is {hit['chapter']}.",
+            print_out=f"[manga] {hit['title']} ch.{hit['chapter']}  →  "
+                      f"{hit['read_url']}")
+
     # ────────────── new: jokes / trivia ──────────────
     def _joke(self, _match) -> CommandResult:
         import fun as fun_mod
@@ -858,6 +924,19 @@ INTENTS: list[tuple[str, Callable[["CommandDispatcher", re.Match], CommandResult
      lambda d, m: d._list_jobs(m)),
     (r"^cancel\s+(?:all\s+)?(?:timers|reminders|jobs)$",
      lambda d, m: d._cancel_jobs(m)),
+
+    # Manga watcher — check all watched series for new chapters.
+    (r"^(?:check(?:\s+for)?\s+(?:new\s+)?(?:manga|chapters?)"
+     r"|any\s+new\s+(?:manga\s+)?chapters?"
+     r"|new\s+chapters?"
+     r"|manga\s+(?:update|check))\s*\??$",
+     lambda d, m: d._manga_check(m)),
+    # One-off lookup: "latest chapter of <series>", "what chapter is X on"
+    (r"^(?:what(?:'s|\s+is)\s+the\s+latest\s+chapter\s+of"
+     r"|latest\s+chapter\s+of"
+     r"|how\s+many\s+chapters?\s+of"
+     r"|what\s+chapter\s+is)\s+(?P<q>.+?)\s*(?:\s+on)?\s*\??$",
+     lambda d, m: d._manga_latest(m.group("q"))),
 
     # Jokes / trivia
     (r"^(?:tell\s+me\s+a\s+)?joke$",

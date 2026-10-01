@@ -894,6 +894,35 @@ def run_hotkey_loop(config: dict, voice: Voice) -> int:
         print("[jarvis] could not register global hotkey; falling back to text mode.")
         return run_text_or_oneshot(config, voice, use_voice=False)
 
+    # ─── manga watcher: boot-time check in a background thread ───
+    # Runs after we're fully armed so a slow MangaDex response never
+    # delays the hotkey registration. First run just records the
+    # baseline silently; subsequent runs announce new chapters.
+    manga_cfg = config.get("manga", {}) or {}
+    if manga_cfg.get("enabled", True) and manga_cfg.get("check_on_boot", True) \
+       and (manga_cfg.get("series") or []):
+        import threading as _th
+        from pathlib import Path as _P
+        boot_delay = float(manga_cfg.get("boot_delay_seconds", 4))
+        config_dir = _P(config["_config_dir"])
+        def _manga_boot_check() -> None:
+            try:
+                import time as _t
+                _t.sleep(boot_delay)
+                import manga_watch as mw
+                drops = mw.check_all(config, config_dir)
+                logging.info(mw.summary_for_log(drops))
+                if drops:
+                    _ind("speaking")
+                    try:
+                        voice.say(mw.format_announcement(drops))
+                    finally:
+                        _ind("idle")
+            except Exception as exc:
+                logging.warning("[manga] boot check crashed: %s", exc)
+        _th.Thread(target=_manga_boot_check, name="manga-boot-check",
+                   daemon=True).start()
+
     print(f"\n=== JARVIS · armed ===")
     print(f"Press {combo.upper()} from any app to talk. Ctrl+C to quit.\n")
     try:
@@ -942,6 +971,9 @@ def main() -> int:
     logging.info("jarvis boot: argv=%s cwd=%s", sys.argv, Path.cwd())
     _write_lock()
     config = load_config(args.config)
+    # Remember where config lives so modules (manga_watch, etc.) can
+    # park sibling state files next to it instead of in cwd.
+    config["_config_dir"] = str(args.config.resolve().parent)
     voice = Voice(
         enabled=config["voice"].get("enabled", True),
         rate=config["voice"].get("rate", 180),
