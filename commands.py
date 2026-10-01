@@ -232,10 +232,65 @@ class CommandDispatcher:
         return CommandResult(speak=f"Searching for {query}.", print_out=f"[jarvis] opened {url}")
 
     def _play_spotify(self, query: str) -> CommandResult:
+        """Play a song in the Spotify DESKTOP app.
+
+        Preferred path (requires [spotify].client_id / client_secret):
+          1. Resolve the top-matching track via Spotify Web API search.
+          2. Launch `spotify:track:<id>` so the desktop app opens
+             directly on that track's page.
+          3. Fire the media Play/Pause key so it starts playing.
+
+        Fallback (no credentials): open the web search page (old
+        behaviour) and nudge the user to add credentials in config.
+        """
+        query = query.strip()
+        if not query:
+            return CommandResult(speak="Play what?", print_out="[spotify] empty query")
+
+        # Allow phrases like "play X on the app" / "en la app" / "from the app"
+        # to be treated as a stronger hint (they don't change the path, but
+        # we strip the trailing hint so it doesn't pollute the search terms).
+        for suffix in (
+            " on the app", " from the app", " en la app", " desde la app",
+            " desde la aplicacion", " en la aplicacion",
+        ):
+            if query.lower().endswith(suffix):
+                query = query[: -len(suffix)].strip()
+                break
+
+        try:
+            import spotify as sp_mod
+        except Exception as exc:
+            logging.warning("spotify module unavailable: %s", exc)
+            sp_mod = None
+
+        api = sp_mod.api_from_config(self.config) if sp_mod else None
+
+        if api is not None and sp_mod is not None:
+            track = api.search_track(query)
+            if track and track.get("uri"):
+                auto_play = bool((self.config.get("spotify") or {})
+                                 .get("auto_play", True))
+                ok = sp_mod.play_track(track["uri"], auto_play=auto_play)
+                if ok:
+                    label = f"{track['name']} by {track['artists']}".strip()
+                    return CommandResult(
+                        speak=f"Playing {label} on Spotify.",
+                        print_out=f"[spotify] {track['uri']}  →  {label}",
+                    )
+                # launch failed; fall through to web fallback
+
+        # ── Fallback: no credentials, no network, or search found nothing ──
         url = f"https://open.spotify.com/search/{urllib.parse.quote_plus(query)}"
         webbrowser.open(url)
-        return CommandResult(speak=f"Looking up {query} on Spotify.",
-                             print_out=f"[jarvis] opened {url}")
+        hint = ""
+        if api is None:
+            hint = (" (Tip: add [spotify].client_id / client_secret to "
+                    "config.toml to play directly in the app.)")
+        return CommandResult(
+            speak=f"Looking up {query} on Spotify.",
+            print_out=f"[jarvis] opened {url}{hint}",
+        )
 
     def _time_now(self, _match) -> CommandResult:
         now = datetime.now().strftime("%I:%M %p")

@@ -127,6 +127,15 @@ favorite_league = "la liga"       # default when you say just "scores"
 [pomodoro]
 work_minutes = 25                 # `pomodoro` command starts a focus block
 
+[spotify]
+# Add Spotify Web API credentials to make "play <song>" open the
+# DESKTOP app on the exact matching track and press Play. Without
+# these, "play X" just opens the search page in a browser.
+# Create a free app at https://developer.spotify.com/dashboard
+client_id     = ""
+client_secret = ""
+auto_play     = true
+
 [apps]
 # Friendly name → what to launch. Edit paths per your machine.
 spotify    = "spotify"

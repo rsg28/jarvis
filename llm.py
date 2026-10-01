@@ -49,7 +49,9 @@ Prefer these EXACT phrasings when you emit `call_intent`:
                                  e.g. "read the todo list", "read config.toml"
   find <name>                    List matching apps / files without opening.
   search <query>                 Google search
-  play <query>                   search Spotify
+  play <song>                    play a specific song on Spotify (desktop app).
+                                 Also matches "pon <song>", "reproduce <song>",
+                                 "pon <song> en la app", "play <song> on Spotify".
   pause | play | next | previous media control keys (whatever is playing)
   what time is it | what day is it
   weather in <location>          e.g. "weather in Vancouver"
