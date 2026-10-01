@@ -70,9 +70,30 @@ class CommandDispatcher:
                 self._remember(text, llm_result)
                 return llm_result
 
+        # Explain *why* we couldn't handle it, so the user knows whether
+        # to rephrase, enable the LLM, check the network, etc.
+        if self._llm is None:
+            disabled = self.config.get("_llm_disabled_reason") \
+                       or "the language model is off"
+            speak = (f"I don't have a command that matches \"{text}\", "
+                     f"and {disabled}, so I can't improvise. "
+                     f"Say help to see what I understand natively.")
+            tag = f"[jarvis] no regex match + llm off ({disabled})"
+        elif self._in_llm_dispatch:
+            # LLM produced a canonical command that itself didn't match —
+            # unusual, but worth naming so we don't ping-pong silently.
+            speak = (f"The language model suggested a command I don't "
+                     f"recognize for \"{text}\". Say help to see what I can do.")
+            tag = "[jarvis] llm produced unknown command"
+        else:
+            why = getattr(self._llm, "last_error", None) \
+                  or "the language model had no useful reply"
+            speak = (f"I don't have a built-in command for \"{text}\", "
+                     f"and {why}. Try rephrasing, or say help.")
+            tag = f"[jarvis] no regex match + llm failed ({why})"
         return CommandResult(
-            speak="I did not catch that. Say help to see what I can do.",
-            print_out=f"[jarvis] not recognized: {text!r}. Try 'help'.",
+            speak=speak,
+            print_out=f"{tag}: {text!r}",
         )
 
     # ────────────── LLM fallback ──────────────
@@ -195,8 +216,9 @@ class CommandDispatcher:
                 subprocess.Popen([cmd])
             return CommandResult(speak=spoken, print_out=print_line)
         except Exception as exc:
-            return CommandResult(speak="I could not open that.",
-                                 print_out=f"[jarvis] launch failed: {exc}")
+            return CommandResult(
+                speak=f"I couldn't launch that: {type(exc).__name__}.",
+                print_out=f"[jarvis] launch failed: {exc}")
 
     def _open_resolved(self, path: Path, spoken_name: str,
                        *, extra_hint: str = "") -> CommandResult:
@@ -216,8 +238,9 @@ class CommandDispatcher:
             return CommandResult(speak=spoken,
                                  print_out=f"[jarvis] opened {path}")
         except Exception as exc:
-            return CommandResult(speak=f"I couldn't open {spoken_name}.",
-                                 print_out=f"[jarvis] open failed: {exc}")
+            return CommandResult(
+                speak=f"I couldn't open {spoken_name}: {type(exc).__name__}.",
+                print_out=f"[jarvis] open failed: {exc}")
 
     @staticmethod
     def _hint_others(others) -> str:
@@ -330,9 +353,11 @@ class CommandDispatcher:
             ) as resp:
                 text = resp.read().decode("utf-8").strip()
             return CommandResult(speak=text, print_out=text)
-        except Exception:
-            return CommandResult(speak="I could not reach the weather service.",
-                                 print_out="[jarvis] wttr.in unreachable")
+        except Exception as exc:
+            return CommandResult(
+                speak=f"I couldn't reach the weather service for {location}: "
+                      f"{type(exc).__name__}.",
+                print_out=f"[jarvis] wttr.in unreachable: {exc}")
 
     def _news(self, match) -> CommandResult:
         import news as news_mod
@@ -417,7 +442,9 @@ class CommandDispatcher:
         try:
             msg = sys_mod.screenshot()
         except Exception as exc:
-            msg = f"Screenshot failed: {exc}"
+            return CommandResult(
+                speak=f"I couldn't take the screenshot: {type(exc).__name__}.",
+                print_out=f"[jarvis] screenshot failed: {exc}")
         return CommandResult(speak="Screenshot saved to your desktop.", print_out=f"[jarvis] {msg}")
 
     # ────────────── new: type text on the user's behalf ──────────────
@@ -451,7 +478,7 @@ class CommandDispatcher:
             keyboard.write(text, delay=0.01)
         except Exception as exc:
             return CommandResult(
-                speak="I can't type right now.",
+                speak=f"I can't type right now: {type(exc).__name__}.",
                 print_out=f"[type] failed: {exc}",
             )
         preview = text if len(text) <= 60 else text[:57] + "..."
@@ -474,7 +501,7 @@ class CommandDispatcher:
             keyboard.press_and_release(combo)
         except Exception as exc:
             return CommandResult(
-                speak="I can't send that key.",
+                speak=f"I couldn't send {combo}: {type(exc).__name__}.",
                 print_out=f"[press] {combo!r} failed: {exc}",
             )
         return CommandResult(print_out=f"[press] {combo}")
@@ -504,9 +531,11 @@ class CommandDispatcher:
         prompt = (prompt or "").strip() or "Describe what is on my screen right now."
         reply = describe_screen(prompt, self._llm)
         if not reply:
+            why = getattr(self._llm, "last_error", None) \
+                  or "the vision model didn't return anything"
             return CommandResult(
-                speak="I couldn't read the screen. Check the log for details.",
-                print_out="[vision] no reply from Gemini",
+                speak=f"I couldn't read the screen: {why}.",
+                print_out=f"[vision] no reply: {why}",
             )
         return CommandResult(speak=reply, print_out=f"[vision] {reply}")
 

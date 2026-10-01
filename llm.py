@@ -110,14 +110,21 @@ class LLM:
         self.temperature = float(temperature)
         self.timeout = float(timeout)
         self.history: Deque[Tuple[str, str]] = deque(maxlen=history_size)
+        # Short human-readable reason for the last infer() -> None result.
+        # The dispatcher reads this so it can tell the user *why* the
+        # LLM didn't help, instead of a generic "I didn't catch that".
+        self.last_error: Optional[str] = None
 
     # ────────────── public ──────────────
     def infer(self, user_text: str) -> Optional[Dict]:
-        """Return a parsed {"action": ..., ...} dict, or None on failure."""
+        """Return a parsed {"action": ..., ...} dict, or None on failure.
+        On failure, self.last_error holds a short human-readable reason."""
+        self.last_error = None
         try:
             import requests
         except ImportError:
             logging.warning("requests not installed; LLM fallback disabled")
+            self.last_error = "the requests library isn't installed"
             return None
 
         url = (
@@ -151,6 +158,13 @@ class LLM:
                 resp = requests.post(url, json=payload, timeout=self.timeout)
             except Exception as exc:
                 logging.warning("LLM request failed: %s", exc)
+                kind = type(exc).__name__.lower()
+                if "timeout" in kind:
+                    self.last_error = "the language model timed out"
+                elif "connection" in kind or "dns" in kind:
+                    self.last_error = "I can't reach the language model (no network)"
+                else:
+                    self.last_error = f"the language model request failed ({type(exc).__name__})"
                 return None
             if resp.status_code == 200:
                 break
@@ -158,8 +172,17 @@ class LLM:
                 _time.sleep(0.6)
                 continue
             logging.warning("LLM HTTP %s: %s", resp.status_code, resp.text[:200])
+            if resp.status_code in (401, 403):
+                self.last_error = "the Gemini API key was rejected"
+            elif resp.status_code == 429:
+                self.last_error = "the Gemini API is rate-limiting us"
+            elif resp.status_code in (500, 502, 503, 504):
+                self.last_error = "Gemini is overloaded right now"
+            else:
+                self.last_error = f"Gemini returned HTTP {resp.status_code}"
             return None
         if resp is None or resp.status_code != 200:
+            self.last_error = self.last_error or "the language model didn't reply"
             return None
 
         try:
@@ -167,11 +190,13 @@ class LLM:
             text = data["candidates"][0]["content"]["parts"][0]["text"]
         except Exception as exc:
             logging.warning("LLM parse failed: %s", exc)
+            self.last_error = "the language model reply couldn't be parsed"
             return None
 
         parsed = self._extract_json(text)
         if not parsed or "action" not in parsed:
             logging.debug("LLM returned no usable JSON: %s", text[:200])
+            self.last_error = "the language model didn't produce a usable answer"
             return None
 
         return parsed
@@ -210,14 +235,19 @@ class LLM:
 
 
 def build_from_config(config: dict) -> Optional["LLM"]:
-    """Return an LLM instance if enabled in config, else None."""
+    """Return an LLM instance if enabled in config, else None.
+    Also stores a human-readable reason in config['_llm_disabled_reason']
+    when it returns None, so the dispatcher can explain to the user."""
     llm_cfg = config.get("llm", {}) or {}
     if not llm_cfg.get("enabled", False):
+        config["_llm_disabled_reason"] = "the language model is turned off in config"
         return None
     api_key = llm_cfg.get("api_key") or os.environ.get("GEMINI_API_KEY", "").strip()
     if not api_key:
         logging.info("LLM enabled but no api_key / GEMINI_API_KEY set")
+        config["_llm_disabled_reason"] = "no Gemini API key is set"
         return None
+    config["_llm_disabled_reason"] = None
     return LLM(
         api_key=api_key,
         model=llm_cfg.get("model", "gemini-3.6-flash"),
