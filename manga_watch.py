@@ -40,6 +40,7 @@ from pathlib import Path
 from typing import List, Optional
 
 import manga as _mx
+import comix as _cx
 
 
 STATE_FILENAME = "manga_state.json"
@@ -119,19 +120,48 @@ def check_all(config: dict, config_dir: Path) -> List[NewChapter]:
     changed = False
 
     for series_cfg in series_list:
-        series_lang = str(series_cfg.get("language", language))
-        resolved = _resolve_manga_id(series_cfg, language=series_lang)
-        if resolved is None:
-            logging.warning("[manga] couldn't resolve %r on MangaDex",
-                            series_cfg.get("name"))
-            continue
-        manga_id, resolved_title = resolved
-        display_name = (series_cfg.get("name") or resolved_title).strip()
+        source = str(series_cfg.get("source", "mangadex")).lower()
 
-        info = _mx.latest_chapter(manga_id, language=series_lang)
-        if info is None or not info.chapter:
-            logging.info("[manga] no chapters yet for %r", display_name)
-            continue
+        # ─── Source: Comix.to (scrapes the page's #initial-data JSON) ───
+        if source == "comix":
+            url = (series_cfg.get("url") or "").strip()
+            if not url:
+                logging.warning("[manga] comix series %r has no `url`",
+                                series_cfg.get("name"))
+                continue
+            info_cx = _cx.latest_chapter_from_url(url)
+            if info_cx is None or not info_cx.chapter:
+                logging.info("[manga] comix: no chapters found for %r",
+                             series_cfg.get("name"))
+                continue
+            # Build a synthetic manga_id so state keys stay stable
+            # even if the user renames the series in config.
+            manga_id = f"comix:{_cx._normalize_title_url(url)}"
+            info = _cx.ChapterInfo(
+                chapter=info_cx.chapter,
+                chapter_num=info_cx.chapter_num,
+                title=info_cx.title,
+                language=info_cx.language,
+                published_at=info_cx.published_at,
+                chapter_id=info_cx.chapter_id,
+                read_url=info_cx.read_url,
+            )
+            display_name = (series_cfg.get("name") or info.title or url).strip()
+
+        # ─── Source: MangaDex (default) ───
+        else:
+            series_lang = str(series_cfg.get("language", language))
+            resolved = _resolve_manga_id(series_cfg, language=series_lang)
+            if resolved is None:
+                logging.warning("[manga] couldn't resolve %r on MangaDex",
+                                series_cfg.get("name"))
+                continue
+            manga_id, resolved_title = resolved
+            display_name = (series_cfg.get("name") or resolved_title).strip()
+            info = _mx.latest_chapter(manga_id, language=series_lang)
+            if info is None or not info.chapter:
+                logging.info("[manga] no chapters yet for %r", display_name)
+                continue
 
         prev_entry = state.get(manga_id, {})
         prev_num = float(prev_entry.get("last_seen_num") or 0.0)
