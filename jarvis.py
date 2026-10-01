@@ -785,6 +785,19 @@ def run_hotkey_loop(config: dict, voice: Voice) -> int:
             _ind("error")
             _safe_print("[hotkey] voice input unavailable (SpeechRecognition/pyaudio missing).")
             return
+        # Replay any pending manga alerts that the user may have
+        # missed since boot (TTS running while they were AFK, etc).
+        # First press clears them.
+        try:
+            import manga_watch as _mw
+            from pathlib import Path as _P
+            pending = _mw.pop_pending(_P(config.get("_config_dir", ".")))
+            if pending and not cancel.is_set():
+                _ind("speaking")
+                voice.say("Before anything — " + pending)
+                _ind("listening")
+        except Exception as exc:
+            logging.debug("pending replay skipped: %s", exc)
         # If the previous voice output was still playing, it's been
         # stopped by the interrupt hook already; reset the flag so
         # this run's "Yes?" isn't cancelled by the stale stop().
@@ -913,6 +926,31 @@ def run_hotkey_loop(config: dict, voice: Voice) -> int:
                 drops = mw.check_all(config, config_dir)
                 logging.info(mw.summary_for_log(drops))
                 if drops:
+                    # Fire every notification channel (toast + optional
+                    # browser + optional email) BEFORE speaking, so the
+                    # Action Center entry is already there even if the
+                    # user is away from the mic / wearing headphones.
+                    try:
+                        import notify as _nf
+                        for d in drops:
+                            n = _nf.Notification(
+                                title=f"New chapter — {d.series_name}",
+                                body=(f"Chapter {d.chapter} just dropped"
+                                      + (f" (you were on {d.previous})"
+                                         if d.previous else "")
+                                      + "."),
+                                url=d.read_url,
+                            )
+                            res = _nf.notify(n, config)
+                            logging.info("[notify] %s → %s", d.series_name, res)
+                    except Exception as exc:
+                        logging.warning("[notify] fan-out crashed: %s", exc)
+                    # Persist as "pending" so the next hotkey press
+                    # replays it in case the TTS was missed.
+                    try:
+                        mw.mark_pending(drops, config_dir)
+                    except Exception as exc:
+                        logging.warning("[manga] mark_pending failed: %s", exc)
                     _ind("speaking")
                     try:
                         voice.say(mw.format_announcement(drops))

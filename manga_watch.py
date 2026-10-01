@@ -43,7 +43,8 @@ import manga as _mx
 import comix as _cx
 
 
-STATE_FILENAME = "manga_state.json"
+STATE_FILENAME   = "manga_state.json"
+PENDING_FILENAME = "manga_pending.json"
 
 
 @dataclass
@@ -215,6 +216,44 @@ def summary_for_log(drops: List[NewChapter]) -> str:
         prev = f" (was {d.previous})" if d.previous else " (first check)"
         lines.append(f"  • {d.series_name}: ch.{d.chapter}{prev}  {d.read_url}")
     return "\n".join(lines)
+
+
+# ────────────────────── pending-alert replay ──────────────────────
+# Boot-time announcements can be missed (user AFK, headphones off,
+# TTS fighting other audio). We stash them in manga_pending.json so
+# the NEXT hotkey press replays them once, then clears.
+def mark_pending(drops: List[NewChapter], config_dir: Path) -> None:
+    if not drops:
+        return
+    path = config_dir / PENDING_FILENAME
+    payload = {
+        "drops": [asdict(d) for d in drops],
+        "stashed_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+    }
+    try:
+        path.write_text(json.dumps(payload, indent=2, ensure_ascii=False),
+                        encoding="utf-8")
+    except Exception as exc:
+        logging.warning("[manga] could not persist pending: %s", exc)
+
+
+def pop_pending(config_dir: Path) -> str:
+    """Return a spoken-friendly string of any pending drops, and delete
+    the pending file so this is a one-shot replay."""
+    path = config_dir / PENDING_FILENAME
+    if not path.exists():
+        return ""
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        drops = [NewChapter(**d) for d in payload.get("drops", [])]
+    except Exception as exc:
+        logging.warning("[manga] pending file unreadable: %s", exc)
+        try: path.unlink()
+        except Exception: pass
+        return ""
+    try: path.unlink()
+    except Exception: pass
+    return format_announcement(drops)
 
 
 # ────────────────────── one-off helpers used by voice commands ──────────────────────
