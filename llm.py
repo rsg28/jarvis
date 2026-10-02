@@ -74,6 +74,15 @@ Prefer these EXACT phrasings when you emit `call_intent`:
   timers                         list active timers
   cancel timers
   joke | trivia
+  check for new chapters         scan the configured manga watchlist for new drops
+  check for new chapters of <series>
+                                 scope the check to one series. "episode" works too.
+                                 e.g. "check if there is a new episode of X",
+                                      "any update on X", "did X update",
+                                      "is there a new chapter of X"
+  latest chapter of <series>     one-off lookup for any manga (watched or not)
+                                 e.g. "what's the latest chapter of chainsaw man",
+                                      "cual es el ultimo capitulo de one piece"
   speak english | speak spanish | speak french | speak british
   stop listening                 end conversation, back to wake mode
   quit                           shut Jarvis down
@@ -145,7 +154,7 @@ class LLM:
             "generationConfig": {
                 "temperature": self.temperature,
                 "responseMimeType": "application/json",
-                "maxOutputTokens": 512,
+                "maxOutputTokens": 1024,
             },
         }
 
@@ -192,14 +201,52 @@ class LLM:
             logging.warning("LLM parse failed: %s", exc)
             self.last_error = "the language model reply couldn't be parsed"
             return None
+        # Debug trace so misfires are inspectable in jarvis.log later.
+        logging.debug("[llm] raw reply: %s", text[:400])
 
         parsed = self._extract_json(text)
-        if not parsed or "action" not in parsed:
-            logging.debug("LLM returned no usable JSON: %s", text[:200])
-            self.last_error = "the language model didn't produce a usable answer"
-            return None
+        if parsed and "action" in parsed:
+            return parsed
 
-        return parsed
+        # ── Graceful degradation: Gemini sometimes forgets the JSON
+        # contract and replies in plain prose. Rather than dropping
+        # the turn and leaving the user with silence, promote the raw
+        # text to a chat reply. This is what the user expects from a
+        # "talk to me naturally" assistant — if the model has something
+        # intelligible to say, say it.
+        stripped = (text or "").strip()
+        if stripped:
+            # Strip any stray code fences so we don't speak backticks.
+            stripped = re.sub(r"^```[a-z]*\s*", "", stripped)
+            stripped = re.sub(r"\s*```\s*$", "", stripped)
+            # Truncated-JSON rescue: Gemini sometimes hits the token
+            # cap mid-reply, so we get something like
+            #   {"action": "chat", "reply": "In chapter 65, Sasaki and
+            # with no closing quote/brace. json.loads can't parse it,
+            # but we can still fish out the reply text. Same for a
+            # complete-but-slightly-malformed response.
+            if stripped.lstrip().startswith("{") or '"reply"' in stripped:
+                m = re.search(r'"reply"\s*:\s*"((?:\\.|[^"\\])*)',
+                              stripped, re.DOTALL)
+                if m:
+                    rescued = (m.group(1)
+                               .replace('\\n', '\n')
+                               .replace('\\"', '"')
+                               .replace('\\\\', '\\')).strip()
+                    if rescued:
+                        logging.info("[llm] rescued reply from truncated "
+                                     "JSON: %s", rescued[:120])
+                        stripped = rescued
+            # Keep it reasonable for TTS.
+            if len(stripped) > 600:
+                stripped = stripped[:597].rsplit(" ", 1)[0] + "…"
+            logging.info("[llm] promoting non-JSON reply to chat: %s",
+                         stripped[:120])
+            return {"action": "chat", "reply": stripped}
+
+        logging.debug("LLM returned nothing usable: %s", text[:200])
+        self.last_error = "the language model returned an empty reply"
+        return None
 
     def remember(self, user_text: str, jarvis_reply: str) -> None:
         """Store an exchange in the rolling context window."""
