@@ -1058,8 +1058,9 @@ INTENTS: list[tuple[str, Callable[["CommandDispatcher", re.Match], CommandResult
      r"|new\s+(?:chapters?|episodes?)"
      r"|(?:did|has|have)\s+(?P<q2>.+?)\s+(?:update|updated|dropped?)"
      r"|manga\s+(?:update|check)"
-     r"|hay\s+(?:un\s+)?nuevo\s+(?:cap[ií]tulo|episodio)"
-     r"|checa\s+(?:si\s+hay\s+)?(?:un\s+)?nuevo\s+(?:cap[ií]tulo|episodio)"
+     r"|hay\s+(?:un\s+)?nuevo\s+(?:cap[ií]tulo|cap|episodio)"
+     r"|(?:checa|revisa|mira|f[ií]jate|chequea)\s+(?:si\s+hay\s+)?(?:un\s+)?"
+     r"(?:nuevo\s+)?(?:cap[ií]tulo|cap|episodio|actualizaci[oó]n)"
      r")"
      r"(?:\s+(?:of|for|on|about|de|del?)\s+(?P<q>.+?))?"
      r"\s*\??$",
@@ -1069,7 +1070,9 @@ INTENTS: list[tuple[str, Callable[["CommandDispatcher", re.Match], CommandResult
      r"|latest\s+(?:chapter|episode)\s+of"
      r"|how\s+many\s+chapters?\s+of"
      r"|what\s+chapter\s+is"
-     r"|cu[aá]l\s+es\s+el\s+(?:[uú]ltimo\s+)?cap[ií]tulo\s+de)"
+     r"|cu[aá]l\s+es\s+el\s+(?:[uú]ltimo\s+)?(?:cap[ií]tulo|cap)\s+de"
+     r"|en\s+qu[eé]\s+(?:cap[ií]tulo|cap)\s+(?:va|est[aá])"
+     r"|qu[eé]\s+(?:cap[ií]tulo|cap)\s+(?:salio|sacaron|hay))"
      r"\s+(?P<q>.+?)\s*(?:\s+on)?\s*\??$",
      lambda d, m: d._manga_latest(m.group("q"))),
 
