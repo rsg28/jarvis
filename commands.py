@@ -1034,6 +1034,11 @@ INTENTS: list[tuple[str, Callable[["CommandDispatcher", re.Match], CommandResult
     # Bare URL after an explicit diagnose intent in natural phrasing
     (r"^(?P<url>https?://\S+)\s+(?:won.?t\s+load|isn.?t\s+loading|is\s+broken|no\s+carga)\s*\.?$",
      lambda d, m: d._diagnose_url(m.group("url"))),
+    # "why won't <url> load" / "why isn't <url> working" — URL in the middle
+    (r"^(?:why\s+(?:won.?t|isn.?t|doesn.?t)\s+|por\s+qu[eé]\s+no\s+(?:carga|funciona)\s+)"
+     r"(?P<url>https?://\S+)"
+     r"(?:\s+(?:load|loading|work|working|cargar|funcionar))?\s*\??$",
+     lambda d, m: d._diagnose_url(m.group("url"))),
 
     # ───── Manga watcher ─────
     # Broad "any new chapters?" style, with optional "of <series>".
