@@ -1018,7 +1018,7 @@ INTENTS: list[tuple[str, Callable[["CommandDispatcher", re.Match], CommandResult
     #   "why won't https://... load" / "what's wrong with https://..."
     #   "averigua el error de <url>" / "por que no carga <url>"
     (r"^(?:diagnose|debug|inspect|check|averigua(?:\s+el\s+error\s+de)?"
-     r"|por\s+qu[eé]\s+no\s+carga|why\s+(?:won.?t|isn.?t|is).{0,15}load"
+     r"|por\s+qu[eé]\s+no\s+carga|why\s+(?:won.?t|isn.?t|is).{0,40}?load(?:ing)?"
      r"|what(?:'s|\s+is)\s+wrong\s+with)\s+(?:this\s+url\s+|this\s+page\s+|the\s+url\s+|the\s+page\s+)?"
      r"(?P<url>https?://\S+)\s*\??$",
      lambda d, m: d._diagnose_url(m.group("url"))),

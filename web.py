@@ -218,18 +218,31 @@ def diagnose(url: str, *, timeout: float = DEFAULT_TIMEOUT) -> Diagnosis:
         broken = [c for c in checks if not c.ok]
         comix = _is_comix_chapter(url)
 
-        if comix and broken:
-            # Comix-aware: for a chapter page the ONLY resources that
-            # matter to the reader are the page images. If every image
-            # host (or the one image host) is down, the chapter is
-            # unreadable even though the page itself loaded 200.
-            diag.summary = (
-                f"The comix page itself loaded fine, but the image CDN "
-                f"{broken[0].host} is unreachable ({broken[0].failure_reason}). "
-                f"That's why the pages won't display. The server is down — "
-                f"it's not something you can fix from the browser. "
-                f"Try the MangaDex mirror instead."
-            )
+        if comix:
+            # Special case: Comix.to is a React SPA. The chapter's PAGE
+            # images are injected at runtime via JavaScript from a
+            # separate CDN whose host doesn't appear in the initial
+            # HTML. So "all hosts OK" means nothing for a reader that
+            # won't render — it only means the shell loaded. Instead,
+            # name that reality explicitly so the user knows this
+            # isn't something the browser can fix.
+            if broken:
+                diag.summary = (
+                    f"The comix shell loaded fine, but one of its hosts "
+                    f"({broken[0].host}) failed with {broken[0].failure_reason}. "
+                    f"That could be why the reader is broken."
+                )
+            else:
+                diag.summary = (
+                    f"The comix page itself loaded fine ({status} in "
+                    f"{elapsed} ms), but comix is a single-page app — "
+                    f"the actual chapter images come from a separate CDN "
+                    f"that's fetched by JavaScript, which I can't see "
+                    f"from the server side. If the reader shows 'Tap to "
+                    f"retry' on every page, that CDN is almost certainly "
+                    f"down. Not something you can fix from the browser. "
+                    f"Try the MangaDex mirror instead."
+                )
         elif broken:
             diag.summary = (
                 f"The page loaded in {elapsed} ms with status {status}, but "
