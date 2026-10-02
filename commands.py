@@ -540,8 +540,26 @@ class CommandDispatcher:
         return CommandResult(speak=reply, print_out=f"[vision] {reply}")
 
     # ────────────── new: manga watcher ──────────────
-    def _manga_check(self, _match) -> CommandResult:
-        """Run the configured manga watcher on demand."""
+    def _manga_check(self, match_or_query) -> CommandResult:
+        """Run the configured manga watcher on demand.
+        Accepts either a regex Match (whose named group `q` may hold a
+        specific series) or a plain string. If a series is named and
+        it's NOT in the watchlist, falls through to a one-shot lookup
+        so phrases like "check for a new chapter of <series I never
+        configured>" still return something useful."""
+        # Resolve the optional query from either call style.
+        query = ""
+        if isinstance(match_or_query, str):
+            query = match_or_query.strip()
+        elif match_or_query is not None:
+            try:
+                query = (match_or_query.groupdict().get("q") or "").strip()
+            except Exception:
+                query = ""
+        # Trim trailing filler like "please", "today", "right now".
+        query = re.sub(r"\s+(please|today|now|right\s+now)\s*$", "", query,
+                       flags=re.IGNORECASE).strip()
+
         try:
             import manga_watch as mw
         except Exception as exc:
@@ -550,6 +568,53 @@ class CommandDispatcher:
                 print_out=f"[manga] import failed: {exc}")
         from pathlib import Path as _P
         config_dir = _P(self.config.get("_config_dir", ".")).resolve()
+
+        # ── Specific series requested ──
+        # Prefer the watched copy (so the user hears "no new, you're on
+        # ch N"); if not watched, fall through to a one-shot lookup.
+        if query:
+            series_list = (self.config.get("manga", {}) or {}).get("series") or []
+            q_tokens = set(re.findall(r"[a-z0-9]+", query.lower()))
+            def _overlap(name: str) -> float:
+                nt = set(re.findall(r"[a-z0-9]+", (name or "").lower()))
+                return len(q_tokens & nt) / max(1, len(q_tokens))
+            scored = [(s, _overlap(s.get("name", ""))) for s in series_list]
+            scored.sort(key=lambda x: x[1], reverse=True)
+            if scored and scored[0][1] >= 0.5:
+                # Series is on the watchlist — run the watcher but
+                # scope it to just that one series by filtering the
+                # config in-flight (cheap: watcher iterates series).
+                scoped = {**self.config,
+                          "manga": {**(self.config.get("manga") or {}),
+                                    "series": [scored[0][0]]}}
+                drops = mw.check_all(scoped, config_dir)
+                if drops:
+                    return CommandResult(
+                        speak=mw.format_announcement(drops),
+                        print_out=mw.summary_for_log(drops))
+                # No drops: report current baseline for that series.
+                name = scored[0][0].get("name", query)
+                try:
+                    import json as _j
+                    state = _j.loads((config_dir / "manga_state.json")
+                                     .read_text(encoding="utf-8"))
+                    last = next((v.get("last_seen_chapter")
+                                 for v in state.values()
+                                 if (v.get("name") or "").lower() == name.lower()),
+                                None)
+                    if last:
+                        return CommandResult(
+                            speak=f"No new chapter. {name} is still on {last}.",
+                            print_out=f"[manga] {name} baseline: ch.{last}")
+                except Exception:
+                    pass
+                return CommandResult(
+                    speak=f"No new chapter of {name} yet.",
+                    print_out=f"[manga] {name}: no update")
+            # Series not on watchlist — one-shot lookup fallback.
+            return self._manga_latest(query)
+
+        # ── No series specified: check EVERYTHING ──
         drops = mw.check_all(self.config, config_dir)
         if not drops:
             # Pull last-seen numbers from the state file so we can tell
@@ -925,17 +990,37 @@ INTENTS: list[tuple[str, Callable[["CommandDispatcher", re.Match], CommandResult
     (r"^cancel\s+(?:all\s+)?(?:timers|reminders|jobs)$",
      lambda d, m: d._cancel_jobs(m)),
 
-    # Manga watcher — check all watched series for new chapters.
-    (r"^(?:check(?:\s+for)?\s+(?:new\s+)?(?:manga|chapters?)"
-     r"|any\s+new\s+(?:manga\s+)?chapters?"
-     r"|new\s+chapters?"
-     r"|manga\s+(?:update|check))\s*\??$",
-     lambda d, m: d._manga_check(m)),
+    # ───── Manga watcher ─────
+    # Broad "any new chapters?" style, with optional "of <series>".
+    # Catches: "check for new chapters", "is there a new chapter of X",
+    #          "check if there is a new episode of X", "any update on X",
+    #          "did X update", "has X updated", "new episode of X",
+    #          "manga update", "hay un nuevo capitulo de X", etc.
+    # "episode" is accepted as a synonym for "chapter" because voice STT
+    # often transcribes it that way (and manga/anime are near-synonyms
+    # in casual speech).
+    (r"^(?:"
+     r"(?:please\s+)?check\s+(?:if\s+there\s+(?:is|are)\s+)?"
+     r"(?:any\s+)?(?:new\s+)?(?:manga\s+)?(?:chapters?|episodes?|updates?)"
+     r"|is\s+there\s+(?:a\s+|any\s+)?new\s+(?:chapter|episode|update)"
+     r"|are\s+there\s+(?:any\s+)?new\s+(?:chapters?|episodes?|updates?)"
+     r"|any\s+(?:new\s+)?(?:manga\s+)?(?:chapters?|episodes?|updates?)"
+     r"|new\s+(?:chapters?|episodes?)"
+     r"|(?:did|has|have)\s+(?P<q2>.+?)\s+(?:update|updated|dropped?)"
+     r"|manga\s+(?:update|check)"
+     r"|hay\s+(?:un\s+)?nuevo\s+(?:cap[ií]tulo|episodio)"
+     r"|checa\s+(?:si\s+hay\s+)?(?:un\s+)?nuevo\s+(?:cap[ií]tulo|episodio)"
+     r")"
+     r"(?:\s+(?:of|for|on|about|de|del?)\s+(?P<q>.+?))?"
+     r"\s*\??$",
+     lambda d, m: d._manga_check(m.group("q") or m.group("q2") or "")),
     # One-off lookup: "latest chapter of <series>", "what chapter is X on"
-    (r"^(?:what(?:'s|\s+is)\s+the\s+latest\s+chapter\s+of"
-     r"|latest\s+chapter\s+of"
+    (r"^(?:what(?:'s|\s+is)\s+the\s+latest\s+(?:chapter|episode)\s+of"
+     r"|latest\s+(?:chapter|episode)\s+of"
      r"|how\s+many\s+chapters?\s+of"
-     r"|what\s+chapter\s+is)\s+(?P<q>.+?)\s*(?:\s+on)?\s*\??$",
+     r"|what\s+chapter\s+is"
+     r"|cu[aá]l\s+es\s+el\s+(?:[uú]ltimo\s+)?cap[ií]tulo\s+de)"
+     r"\s+(?P<q>.+?)\s*(?:\s+on)?\s*\??$",
      lambda d, m: d._manga_latest(m.group("q"))),
 
     # Jokes / trivia
