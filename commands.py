@@ -1000,8 +1000,8 @@ INTENTS: list[tuple[str, Callable[["CommandDispatcher", re.Match], CommandResult
     # often transcribes it that way (and manga/anime are near-synonyms
     # in casual speech).
     (r"^(?:"
-     r"(?:please\s+)?check\s+(?:if\s+there\s+(?:is|are)\s+)?"
-     r"(?:any\s+)?(?:new\s+)?(?:manga\s+)?(?:chapters?|episodes?|updates?)"
+     r"(?:please\s+)?check\s+(?:(?:if\s+there\s+(?:is|are)\s+)|(?:for\s+))?"
+     r"(?:(?:a|any)\s+)?(?:new\s+)?(?:manga\s+)?(?:chapters?|episodes?|updates?)"
      r"|is\s+there\s+(?:a\s+|any\s+)?new\s+(?:chapter|episode|update)"
      r"|are\s+there\s+(?:any\s+)?new\s+(?:chapters?|episodes?|updates?)"
      r"|any\s+(?:new\s+)?(?:manga\s+)?(?:chapters?|episodes?|updates?)"
