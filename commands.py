@@ -539,6 +539,29 @@ class CommandDispatcher:
             )
         return CommandResult(speak=reply, print_out=f"[vision] {reply}")
 
+    # ────────────── new: web diagnose ──────────────
+    def _diagnose_url(self, url: str) -> CommandResult:
+        """Fetch a URL, test its referenced hosts, and explain WHY it
+        isn't loading. Great for the "the page just won't load" case
+        where screen vision can only read 'Tap to retry'."""
+        url = (url or "").strip().strip('"').strip("'")
+        if not url:
+            return CommandResult(
+                speak="Diagnose which URL?",
+                print_out="[web] empty url")
+        # Accept bare domains too — add https:// so urllib works.
+        if not re.match(r"^https?://", url, re.IGNORECASE):
+            url = "https://" + url.lstrip("/")
+        try:
+            import web as _web
+        except Exception as exc:
+            return CommandResult(
+                speak=f"The web module failed to load: {type(exc).__name__}.",
+                print_out=f"[web] import failed: {exc}")
+        diag = _web.diagnose(url)
+        return CommandResult(speak=diag.summary,
+                             print_out=diag.detail or diag.summary)
+
     # ────────────── new: manga watcher ──────────────
     def _manga_check(self, match_or_query) -> CommandResult:
         """Run the configured manga watcher on demand.
@@ -989,6 +1012,28 @@ INTENTS: list[tuple[str, Callable[["CommandDispatcher", re.Match], CommandResult
      lambda d, m: d._list_jobs(m)),
     (r"^cancel\s+(?:all\s+)?(?:timers|reminders|jobs)$",
      lambda d, m: d._cancel_jobs(m)),
+
+    # Diagnose a URL / page. Catches:
+    #   "diagnose https://..." / "check this url" / "why is this page broken"
+    #   "why won't https://... load" / "what's wrong with https://..."
+    #   "averigua el error de <url>" / "por que no carga <url>"
+    (r"^(?:diagnose|debug|inspect|check|averigua(?:\s+el\s+error\s+de)?"
+     r"|por\s+qu[eé]\s+no\s+carga|why\s+(?:won.?t|isn.?t|is).{0,15}load"
+     r"|what(?:'s|\s+is)\s+wrong\s+with)\s+(?:this\s+url\s+|this\s+page\s+|the\s+url\s+|the\s+page\s+)?"
+     r"(?P<url>https?://\S+)\s*\??$",
+     lambda d, m: d._diagnose_url(m.group("url"))),
+    # Short form when the URL is on its own line and the user already
+    # said "diagnose this" in a prior turn: just a bare URL triggers
+    # diagnose when prefixed with "why won't it load", etc.
+    (r"^(?:why\s+(?:won.?t|isn.?t)\s+(?:it|this|the\s+page)\s+load"
+     r"|why\s+is\s+this\s+(?:not\s+loading|broken)"
+     r"|what.?s\s+wrong\s+with\s+this\s+page"
+     r"|diagnose\s+(?:this|it)|debug\s+(?:this|it))\s*\??\s+"
+     r"(?P<url>https?://\S+)\s*\??$",
+     lambda d, m: d._diagnose_url(m.group("url"))),
+    # Bare URL after an explicit diagnose intent in natural phrasing
+    (r"^(?P<url>https?://\S+)\s+(?:won.?t\s+load|isn.?t\s+loading|is\s+broken|no\s+carga)\s*\.?$",
+     lambda d, m: d._diagnose_url(m.group("url"))),
 
     # ───── Manga watcher ─────
     # Broad "any new chapters?" style, with optional "of <series>".

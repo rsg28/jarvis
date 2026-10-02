@@ -74,6 +74,13 @@ Prefer these EXACT phrasings when you emit `call_intent`:
   timers                         list active timers
   cancel timers
   joke | trivia
+  diagnose <url>                 fetch a URL, test its referenced hosts, and
+                                 explain why it isn't loading. Covers DNS,
+                                 SSL, timeout, 4xx/5xx, and for comix.to
+                                 chapter pages also detects a dead image CDN.
+                                 e.g. "why isn't this page loading <url>",
+                                      "averigua el error de <url>",
+                                      "what's wrong with <url>"
   check for new chapters         scan the configured manga watchlist for new drops
   check for new chapters of <series>
                                  scope the check to one series. "episode" works too.
