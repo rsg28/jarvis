@@ -130,12 +130,38 @@ class LLM:
         # The dispatcher reads this so it can tell the user *why* the
         # LLM didn't help, instead of a generic "I didn't catch that".
         self.last_error: Optional[str] = None
+        # In-process TTL cache keyed by normalised transcript. When the
+        # user says the same thing twice ("revisa si hay nuevo cap"),
+        # we re-use Gemini's previous routing decision instead of
+        # burning another request. Default 10 min, configurable via
+        # [llm].cache_seconds. Set to 0 to disable.
+        self._cache: Dict[str, Tuple[float, Dict]] = {}
+        self._cache_ttl: float = 600.0
 
     # ────────────── public ──────────────
     def infer(self, user_text: str) -> Optional[Dict]:
         """Return a parsed {"action": ..., ...} dict, or None on failure.
-        On failure, self.last_error holds a short human-readable reason."""
+        On failure, self.last_error holds a short human-readable reason.
+
+        Transparent TTL cache: identical transcripts (case/space-normalised)
+        within self._cache_ttl seconds reuse the previous decision, so
+        rapid repeat phrasings don't burn RPM. Only successful parses
+        are cached — errors always re-try next time."""
         self.last_error = None
+
+        # Cache lookup (normalised: lowercase, collapsed whitespace)
+        import time as _t
+        cache_key = " ".join(user_text.lower().split())
+        now = _t.time()
+        if self._cache_ttl > 0 and cache_key in self._cache:
+            ts, cached_parsed = self._cache[cache_key]
+            if now - ts < self._cache_ttl:
+                logging.debug("[llm] cache hit (%ds old): %r",
+                              int(now - ts), cache_key[:60])
+                return cached_parsed
+            # expired — drop it
+            del self._cache[cache_key]
+
         try:
             import requests
         except ImportError:
@@ -213,6 +239,8 @@ class LLM:
 
         parsed = self._extract_json(text)
         if parsed and "action" in parsed:
+            if self._cache_ttl > 0:
+                self._cache[cache_key] = (now, parsed)
             return parsed
 
         # ── Graceful degradation: Gemini sometimes forgets the JSON
@@ -249,7 +277,10 @@ class LLM:
                 stripped = stripped[:597].rsplit(" ", 1)[0] + "…"
             logging.info("[llm] promoting non-JSON reply to chat: %s",
                          stripped[:120])
-            return {"action": "chat", "reply": stripped}
+            promoted = {"action": "chat", "reply": stripped}
+            if self._cache_ttl > 0:
+                self._cache[cache_key] = (now, promoted)
+            return promoted
 
         logging.debug("LLM returned nothing usable: %s", text[:200])
         self.last_error = "the language model returned an empty reply"
@@ -302,10 +333,12 @@ def build_from_config(config: dict) -> Optional["LLM"]:
         config["_llm_disabled_reason"] = "no Gemini API key is set"
         return None
     config["_llm_disabled_reason"] = None
-    return LLM(
+    inst = LLM(
         api_key=api_key,
         model=llm_cfg.get("model", "gemini-3.6-flash"),
         temperature=float(llm_cfg.get("temperature", 0.3)),
         timeout=float(llm_cfg.get("timeout_seconds", 6.0)),
         history_size=int(llm_cfg.get("history_size", 5)),
     )
+    inst._cache_ttl = float(llm_cfg.get("cache_seconds", 600.0))
+    return inst

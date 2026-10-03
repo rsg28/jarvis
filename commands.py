@@ -56,6 +56,45 @@ class CommandDispatcher:
         if not text:
             return CommandResult()
 
+        # Dispatch order is config-driven. Default is `llm_first = true`
+        # when the LLM is available, because natural phrasings (which
+        # the user actually says) don't survive small wording changes
+        # against brittle regex. Regex becomes a deterministic fallback
+        # for when the LLM is rate-limited, offline, or disabled.
+        llm_cfg = self.config.get("llm") or {}
+        llm_first = (self._llm is not None
+                     and not self._in_llm_dispatch
+                     and bool(llm_cfg.get("llm_first", True)))
+
+        # ── Safety net: a handful of commands must ALWAYS work
+        # instantly and locally — "quit", "stop listening", "help",
+        # media keys, volume — because they're used constantly and
+        # must survive a dead LLM. We check these up front even in
+        # llm-first mode so there's zero added latency on them.
+        if llm_first:
+            for pattern in _CRITICAL_INTENT_PATTERNS:
+                if re.match(pattern, text, re.IGNORECASE):
+                    # Fall through to the regex loop below, which has
+                    # these in its table.
+                    for pat, handler in INTENTS:
+                        m = re.match(pat, text, re.IGNORECASE)
+                        if m:
+                            result = handler(self, m)
+                            self._remember(text, result)
+                            return result
+
+        # ── LLM-first path (default when enabled) ──
+        if llm_first:
+            llm_result = self._try_llm(text)
+            if llm_result is not None:
+                self._remember(text, llm_result)
+                return llm_result
+            # LLM failed (rate-limited, offline, no key, etc). Fall
+            # through to regex so the user still gets a reply.
+            logging.info("[dispatch] LLM failed, falling back to regex "
+                         "(reason: %s)", getattr(self._llm, "last_error", None))
+
+        # ── Regex path (either regex-first mode, or LLM fallback) ──
         for pattern, handler in INTENTS:
             match = re.match(pattern, text, re.IGNORECASE)
             if match:
@@ -63,8 +102,8 @@ class CommandDispatcher:
                 self._remember(text, result)
                 return result
 
-        # Nothing matched — try the LLM before giving up.
-        if self._llm is not None and not self._in_llm_dispatch:
+        # ── LLM try (if we were regex-first and regex missed) ──
+        if not llm_first and self._llm is not None and not self._in_llm_dispatch:
             llm_result = self._try_llm(text)
             if llm_result is not None:
                 self._remember(text, llm_result)
@@ -903,6 +942,28 @@ class CommandDispatcher:
         # for another wake word. Wake listener already returned by the
         # time this fires; we just need a spoken acknowledgement.
         return CommandResult(speak="Standing by, sir. Just say 'hey jarvis' when you need me.")
+
+
+# ────────────── critical fast-path (always local) ──────────────
+# A handful of commands MUST work in microseconds and must survive a
+# dead/rate-limited LLM: process-control (quit/stop), help, media
+# transport (play/pause/next/prev/volume). In LLM-first mode we match
+# these up front so there's zero added latency on them. Everything
+# else routes through the LLM for natural-phrasing tolerance.
+_CRITICAL_INTENT_PATTERNS = [
+    r"^__stop_listening__$",
+    r"^(?:quit|exit|bye|goodbye|shutdown|apagate|cierrate|cerrar)$",
+    r"^(?:stop\s+listening|stop)$",
+    r"^(?:help|what\s+can\s+you\s+do|commands?|ayuda)$",
+    # Media keys — zero-latency essential for a voice assistant.
+    r"^(?:pause|play|resume|toggle\s+playback|pausa|reanuda)$",
+    r"^(?:next(?:\s+(?:song|track))?|skip|siguiente)$",
+    r"^(?:previous(?:\s+(?:song|track))?|back|prev|anterior)$",
+    # Volume shortcuts.
+    r"^(?:volume\s+up|louder|sube\s+(?:el\s+)?volumen)(?:\s+\d+)?$",
+    r"^(?:volume\s+down|quieter|baja\s+(?:el\s+)?volumen)(?:\s+\d+)?$",
+    r"^(?:mute|unmute|silencio)$",
+]
 
 
 # ────────────── intent table ──────────────
