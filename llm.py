@@ -74,6 +74,18 @@ Prefer these EXACT phrasings when you emit `call_intent`:
   timers                         list active timers
   cancel timers
   joke | trivia
+  learn <path>                   ingest a document (.pdf/.docx/.xlsx/.txt/.md/
+                                 .csv) into the knowledge base. From then on,
+                                 questions about its content are answered
+                                 with the doc as grounding context.
+                                 e.g. "learn my protocol.pdf", "study the
+                                       patient worksheet", "aprende este pdf",
+                                       "remember this file ..."
+  what documents do you know     list ingested docs
+                                 e.g. "list my documents", "qué documentos
+                                       tienes", "knowledge base"
+  forget <doc>                   remove a doc from the knowledge base.
+                                 "forget everything" / "forget all" wipes it.
   diagnose <url>                 fetch a URL, test its referenced hosts, and
                                  explain why it isn't loading. Covers DNS,
                                  SSL, timeout, 4xx/5xx, and for comix.to

@@ -39,9 +39,26 @@ class CommandDispatcher:
         # is available. `None` means "regex-only mode".
         from llm import build_from_config
         self._llm = build_from_config(config)
+        # Lazy knowledge-base (RAG). Built on first use so startup stays
+        # fast even with many ingested docs. See knowledge.py.
+        self._kb = None
+        self._kb_built = False
         # Re-entrancy guard so an LLM-produced command that also fails to
         # match never triggers another LLM round-trip.
         self._in_llm_dispatch = False
+
+    def _get_kb(self):
+        """Lazy KnowledgeBase builder — only hits disk/API when first
+        asked. Caches the (possibly None) result."""
+        if not self._kb_built:
+            try:
+                from knowledge import build_from_config
+                self._kb = build_from_config(self.config)
+            except Exception as exc:
+                logging.warning("[kb] builder failed: %s", exc)
+                self._kb = None
+            self._kb_built = True
+        return self._kb
 
     def _get_scheduler(self):
         if self._scheduler is None:
@@ -138,8 +155,39 @@ class CommandDispatcher:
     # ────────────── LLM fallback ──────────────
     def _try_llm(self, text: str) -> Optional[CommandResult]:
         """Ask Gemini to convert the transcript into either a canonical
-        command (re-dispatched here) or a short chat reply (spoken)."""
-        parsed = self._llm.infer(text)
+        command (re-dispatched here) or a short chat reply (spoken).
+        If the user has ingested documents, retrieval runs transparently
+        first — relevant chunks become grounding context for Gemini."""
+        # ── RAG augmentation ──
+        # Only augment on free-form chatty-looking input. Short/command-y
+        # input ("open spotify", "pause", "volume up") won't benefit and
+        # we don't want to burn embed calls on them.
+        augmented = text
+        used_kb = False
+        if self._looks_chatty(text):
+            kb = self._get_kb()
+            if kb is not None and kb.docs:
+                try:
+                    hits = kb.search(text)
+                except Exception as exc:
+                    logging.warning("[kb] search failed: %s", exc)
+                    hits = []
+                if hits:
+                    from knowledge import format_context
+                    context = format_context(hits)
+                    augmented = (
+                        "The user has uploaded reference documents. Use the "
+                        "following excerpts to answer. If the answer isn't in "
+                        "these excerpts, say so plainly — don't invent facts. "
+                        "Cite the source document name when you use it.\n\n"
+                        f"=== REFERENCE EXCERPTS ===\n{context}\n=== END ===\n\n"
+                        f"User question: {text}"
+                    )
+                    used_kb = True
+                    logging.info("[kb] grounding reply on %d chunks "
+                                 "(top score %.2f)", len(hits), hits[0].score)
+
+        parsed = self._llm.infer(augmented)
         if not parsed:
             return None
 
@@ -577,6 +625,113 @@ class CommandDispatcher:
                 print_out=f"[vision] no reply: {why}",
             )
         return CommandResult(speak=reply, print_out=f"[vision] {reply}")
+
+    # ────────────── new: knowledge base (RAG) ──────────────
+    @staticmethod
+    def _looks_chatty(text: str) -> bool:
+        """Heuristic: is this a question / long free-form sentence that
+        would benefit from doc grounding, or a short imperative?"""
+        t = text.strip()
+        if "?" in t or "¿" in t:
+            return True
+        if len(t.split()) >= 6:
+            return True
+        # Common question starters EN/ES/FR
+        lead = t.lower().split(maxsplit=1)[0] if t else ""
+        return lead in {
+            "what", "why", "how", "when", "where", "who", "which",
+            "qué", "que", "por", "cómo", "como", "cuándo", "cuando",
+            "dónde", "donde", "quién", "quien", "cuál", "cual",
+            "explain", "tell", "describe", "summarize", "summarise",
+            "explica", "cuéntame", "cuentame", "resume", "describe",
+        }
+
+    def _kb_learn(self, path: str) -> CommandResult:
+        """Ingest a file: extract, chunk, embed, persist."""
+        path = (path or "").strip().strip('"').strip("'")
+        if not path:
+            return CommandResult(speak="Learn which file?",
+                                 print_out="[kb] empty path")
+        kb = self._get_kb()
+        if kb is None:
+            return CommandResult(
+                speak="I can't learn files without a Gemini API key configured.",
+                print_out="[kb] no api key available")
+        # Resolve relative paths via the usual resolver so the user can
+        # just say "learn my protocol" without a full absolute path.
+        from pathlib import Path as _P
+        p = _P(path).expanduser()
+        if not p.exists():
+            import resolver as _r
+            resolved = _r.resolve_path(path)
+            if resolved is None:
+                extra = self.config.get("resolver", {}).get("extra_roots", []) or []
+                match = _r.find_best(path, roots=extra, kinds=("file",))
+                if match is not None:
+                    p = _P(match.path)
+            else:
+                p = resolved
+        if not p.exists() or not p.is_file():
+            return CommandResult(
+                speak=f"I couldn't find a file called {path}.",
+                print_out=f"[kb] path not found: {path}")
+        try:
+            stats = kb.ingest(p)
+        except ValueError as exc:
+            return CommandResult(
+                speak=str(exc), print_out=f"[kb] ingest refused: {exc}")
+        except Exception as exc:
+            logging.exception("[kb] ingest failed")
+            return CommandResult(
+                speak=f"I couldn't learn {p.name}: {type(exc).__name__}.",
+                print_out=f"[kb] ingest failed: {exc}")
+        return CommandResult(
+            speak=(f"Got it. Learned {stats['doc']} — "
+                   f"{stats['chunks']} sections indexed. "
+                   f"Ask me anything about it."),
+            print_out=f"[kb] ingested {stats['doc']}: "
+                      f"{stats['chars']} chars, {stats['chunks']} chunks")
+
+    def _kb_list(self, _match) -> CommandResult:
+        kb = self._get_kb()
+        if kb is None or not kb.docs:
+            return CommandResult(
+                speak="I don't have any documents in memory yet. "
+                      "Say 'learn' and give me a file to start.",
+                print_out="[kb] empty")
+        docs = kb.list_docs()
+        lines = [f"── Knowledge base ({len(docs)} docs) ──"]
+        for d in docs:
+            lines.append(f"  • {d['doc']}  —  {d['chunks']} chunks, "
+                         f"{d['chars']} chars  (ingested {d['ingested_at']})")
+        spoken = (f"I know {len(docs)} document{'s' if len(docs) != 1 else ''}: "
+                  + ", ".join(d['doc'] for d in docs[:5]))
+        if len(docs) > 5:
+            spoken += f", and {len(docs) - 5} more"
+        return CommandResult(speak=spoken + ".", print_out="\n".join(lines))
+
+    def _kb_forget(self, doc: str) -> CommandResult:
+        doc = (doc or "").strip().strip('"').strip("'")
+        if not doc:
+            return CommandResult(speak="Forget which document?",
+                                 print_out="[kb] empty doc")
+        kb = self._get_kb()
+        if kb is None or not kb.docs:
+            return CommandResult(speak="There's nothing in my knowledge base.",
+                                 print_out="[kb] empty")
+        if doc.lower() in ("all", "everything", "todo", "todos"):
+            n = kb.clear()
+            return CommandResult(
+                speak=f"Cleared {n} document{'s' if n != 1 else ''} from memory.",
+                print_out=f"[kb] cleared {n} docs")
+        ok = kb.forget(doc)
+        if not ok:
+            return CommandResult(
+                speak=f"I don't have anything matching {doc}.",
+                print_out=f"[kb] no match for {doc!r}")
+        return CommandResult(
+            speak=f"Forgotten. {doc} is out of my memory.",
+            print_out=f"[kb] removed {doc!r}")
 
     # ────────────── new: web diagnose ──────────────
     def _diagnose_url(self, url: str) -> CommandResult:
@@ -1073,6 +1228,26 @@ INTENTS: list[tuple[str, Callable[["CommandDispatcher", re.Match], CommandResult
      lambda d, m: d._list_jobs(m)),
     (r"^cancel\s+(?:all\s+)?(?:timers|reminders|jobs)$",
      lambda d, m: d._cancel_jobs(m)),
+
+    # ───── Knowledge base (RAG) ─────
+    # Ingest: "learn <path>", "study <path>", "aprende de <path>",
+    #         "remember this file <path>", "ingest <path>"
+    (r"^(?:learn(?:\s+from)?|study|read\s+and\s+remember|remember(?:\s+this(?:\s+file)?)?|ingest"
+     r"|aprende(?:\s+de)?|aprende\s+este\s+(?:archivo|documento)"
+     r"|memoriza(?:\s+este)?)\s+(?P<q>.+?)\s*\??$",
+     lambda d, m: d._kb_learn(m.group("q"))),
+    # List: "what documents do you know", "list my documents", "what have you learned"
+    (r"^(?:what\s+documents?\s+do\s+you\s+(?:know|have|remember)"
+     r"|list\s+(?:my\s+)?documents?"
+     r"|what\s+(?:files|docs)\s+have\s+you\s+learned"
+     r"|qu[eé]\s+documentos?\s+(?:tienes|conoces|sabes)"
+     r"|lista\s+(?:los\s+)?documentos?"
+     r"|knowledge\s+base|kb\s+list)\s*\??$",
+     lambda d, m: d._kb_list(m)),
+    # Forget: "forget <doc>", "forget everything", "olvida <doc>"
+    (r"^(?:forget|unlearn|remove|delete|olvida(?:te\s+de)?|borra)\s+"
+     r"(?P<q>.+?)\s*\??$",
+     lambda d, m: d._kb_forget(m.group("q"))),
 
     # Diagnose a URL / page. Catches:
     #   "diagnose https://..." / "check this url" / "why is this page broken"
