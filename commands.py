@@ -228,6 +228,15 @@ class CommandDispatcher:
             command = (parsed.get("command") or "").strip()
             if not command:
                 return None
+            # Normalise common Qwen misroutes before re-dispatch.
+            # Observed empirically with qwen2.5:7b-instruct:
+            #   * "type foo.txt content: bar" is really a write (Qwen
+            #     keeps the `content:` syntax but picks the wrong verb)
+            #   * "forget notas.txt" with a filename extension is
+            #     really a `delete file` (Qwen conflates borrar=forget)
+            # Both corrections are safe because the real intents
+            # (type a snippet / forget a KB doc) never use those shapes.
+            command = self._normalize_llm_command(command)
             # Re-dispatch the LLM's canonical command through the same
             # regex table so the execution path is identical to a typed
             # command. The re-entrancy guard prevents an LLM ping-pong.
@@ -252,6 +261,27 @@ class CommandDispatcher:
             return CommandResult(speak=reply, print_out=reply)
 
         return None
+
+    @staticmethod
+    def _normalize_llm_command(cmd: str) -> str:
+        """Correct a handful of known Qwen 7B routing mistakes before
+        we re-dispatch the LLM's canonical command. Each rewrite is
+        narrow: it only fires on shapes the legitimate target intent
+        would never produce, so there's no regression risk."""
+        low = cmd.lower()
+        # "type foo content: bar" -> "write foo content: bar"
+        # The `type` intent is single-argument free text; it never
+        # includes " content:" literally.
+        if low.startswith("type ") and " content:" in low:
+            return "write " + cmd[5:]
+        # "forget <path-with-extension>" -> "delete file <path>"
+        # The `forget` intent targets KB doc names, not .txt / .log /
+        # .py paths. A bare dotted extension means it's a real file.
+        import re as _re
+        m = _re.match(r"^forget\s+(.+\.[a-zA-Z0-9]{1,6})\s*$", cmd)
+        if m:
+            return f"delete file {m.group(1)}"
+        return cmd
 
     def _remember(self, user_text: str, result: CommandResult) -> None:
         """Feed successful exchanges back into the LLM's context window
@@ -1119,6 +1149,181 @@ class CommandDispatcher:
             ui_action="help",
         )
 
+    # ────────────── file ops (Phase 1) ──────────────
+    # Safety model
+    # ------------
+    # * Relative paths resolve inside WORKSPACE_ROOT (default
+    #   ~/Desktop/jarvis-workspace, overridable via [files].workspace).
+    # * Absolute paths are allowed but a short deny-list blocks
+    #   writes/deletes under Windows system directories so Jarvis
+    #   can never nuke the OS.
+    # * Deletes are file-only. Removing directories needs a separate
+    #   "remove folder" intent so a one-word slip can't take out a tree.
+
+    def _workspace_root(self) -> Path:
+        cfg = (self.config.get("files", {}) or {}).get("workspace")
+        if cfg:
+            root = Path(str(cfg)).expanduser()
+        else:
+            root = Path.home() / "Desktop" / "jarvis-workspace"
+        root.mkdir(parents=True, exist_ok=True)
+        return root
+
+    @staticmethod
+    def _is_system_path(path: Path) -> bool:
+        """True if `path` falls under a Windows directory we refuse
+        to write to. Compared on the resolved path so symlinks and
+        .. tricks can't bypass it."""
+        try:
+            resolved = str(path.resolve()).lower()
+        except Exception:
+            resolved = str(path).lower()
+        for bad in (r"c:\windows", r"c:\program files",
+                    r"c:\program files (x86)", r"c:\programdata"):
+            if resolved.startswith(bad):
+                return True
+        return False
+
+    def _resolve_user_path(self, raw: str) -> Path:
+        """Turn a spoken path into an absolute Path. Absolute paths
+        pass through; relative paths resolve under the workspace."""
+        raw = (raw or "").strip().strip('"').strip("'")
+        p = Path(raw).expanduser()
+        if not p.is_absolute():
+            p = self._workspace_root() / p
+        return p
+
+    def _write_file(self, path: str, content: str,
+                    *, append: bool = False) -> CommandResult:
+        target = self._resolve_user_path(path)
+        if self._is_system_path(target):
+            return CommandResult(
+                speak="I won't write inside a Windows system folder.",
+                print_out=f"[write] refused system path: {target}")
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            mode = "a" if append else "w"
+            with target.open(mode, encoding="utf-8", newline="\n") as fh:
+                fh.write(content)
+                if append and not content.endswith("\n"):
+                    fh.write("\n")
+        except Exception as exc:
+            return CommandResult(
+                speak=f"I couldn't {'append to' if append else 'write'} "
+                      f"{target.name}: {type(exc).__name__}.",
+                print_out=f"[write] {target}: {exc}")
+        verb = "Appended to" if append else "Wrote"
+        return CommandResult(
+            speak=f"{verb} {target.name}, {len(content)} characters.",
+            print_out=f"[write] {verb.lower()} {target} ({len(content)} chars)")
+
+    def _delete_file(self, path: str) -> CommandResult:
+        target = self._resolve_user_path(path)
+        if self._is_system_path(target):
+            return CommandResult(
+                speak="I won't delete inside a Windows system folder.",
+                print_out=f"[delete] refused system path: {target}")
+        if not target.exists():
+            return CommandResult(
+                speak=f"{target.name} doesn't exist.",
+                print_out=f"[delete] not found: {target}")
+        if target.is_dir():
+            return CommandResult(
+                speak=f"{target.name} is a folder. Say "
+                      f"'remove folder {target.name}' if you really mean it.",
+                print_out=f"[delete] refused directory: {target}")
+        try:
+            target.unlink()
+        except Exception as exc:
+            return CommandResult(
+                speak=f"I couldn't delete {target.name}: {type(exc).__name__}.",
+                print_out=f"[delete] {target}: {exc}")
+        return CommandResult(
+            speak=f"Deleted {target.name}.",
+            print_out=f"[delete] {target}")
+
+    def _mkdir(self, path: str) -> CommandResult:
+        target = self._resolve_user_path(path)
+        if self._is_system_path(target):
+            return CommandResult(
+                speak="I won't create folders inside a Windows system path.",
+                print_out=f"[mkdir] refused system path: {target}")
+        try:
+            target.mkdir(parents=True, exist_ok=True)
+        except Exception as exc:
+            return CommandResult(
+                speak=f"I couldn't create {target.name}: {type(exc).__name__}.",
+                print_out=f"[mkdir] {target}: {exc}")
+        return CommandResult(
+            speak=f"Folder {target.name} ready.",
+            print_out=f"[mkdir] {target}")
+
+    def _remove_folder(self, path: str) -> CommandResult:
+        """Recursive — explicitly separate from _delete_file so a
+        voice slip ("delete whatever") can't take a whole tree."""
+        import shutil
+        target = self._resolve_user_path(path)
+        if self._is_system_path(target):
+            return CommandResult(
+                speak="I won't remove a Windows system folder.",
+                print_out=f"[rmdir] refused system path: {target}")
+        if target.resolve() == self._workspace_root().resolve():
+            return CommandResult(
+                speak="I won't remove the workspace root itself.",
+                print_out=f"[rmdir] refused workspace root: {target}")
+        if not target.exists():
+            return CommandResult(
+                speak=f"{target.name} doesn't exist.",
+                print_out=f"[rmdir] not found: {target}")
+        if not target.is_dir():
+            return CommandResult(
+                speak=f"{target.name} is a file, not a folder.",
+                print_out=f"[rmdir] not a dir: {target}")
+        try:
+            shutil.rmtree(target)
+        except Exception as exc:
+            return CommandResult(
+                speak=f"I couldn't remove {target.name}: {type(exc).__name__}.",
+                print_out=f"[rmdir] {target}: {exc}")
+        return CommandResult(
+            speak=f"Removed folder {target.name}.",
+            print_out=f"[rmdir] {target}")
+
+    def _list_dir(self, path: str) -> CommandResult:
+        target = self._resolve_user_path(path or ".")
+        if not target.exists():
+            return CommandResult(
+                speak=f"{target.name} doesn't exist.",
+                print_out=f"[ls] not found: {target}")
+        if not target.is_dir():
+            return CommandResult(
+                speak=f"{target.name} is a file.",
+                print_out=f"[ls] not a dir: {target}")
+        try:
+            entries = sorted(target.iterdir(),
+                             key=lambda p: (not p.is_dir(), p.name.lower()))
+        except Exception as exc:
+            return CommandResult(
+                speak=f"I couldn't list {target.name}: {type(exc).__name__}.",
+                print_out=f"[ls] {target}: {exc}")
+        if not entries:
+            return CommandResult(
+                speak=f"{target.name} is empty.",
+                print_out=f"[ls] {target} (empty)")
+        # Spoken summary: counts + first few names
+        n_dirs = sum(1 for e in entries if e.is_dir())
+        n_files = len(entries) - n_dirs
+        preview = ", ".join(e.name for e in entries[:6])
+        if len(entries) > 6:
+            preview += f", and {len(entries) - 6} more"
+        spoken = (f"{target.name}: {n_dirs} folder"
+                  f"{'s' if n_dirs != 1 else ''}, "
+                  f"{n_files} file{'s' if n_files != 1 else ''}. {preview}.")
+        printed = "\n".join(
+            f"  {'[d] ' if e.is_dir() else '    '}{e.name}" for e in entries)
+        return CommandResult(speak=spoken,
+                             print_out=f"[ls] {target}\n{printed}")
+
     def _quit(self, _match) -> CommandResult:
         return CommandResult(speak="Signing off. Have a productive day.",
                              print_out="[jarvis] goodbye", should_exit=True)
@@ -1210,9 +1415,30 @@ INTENTS: list[tuple[str, Callable[["CommandDispatcher", re.Match], CommandResult
     (r"^(?:screenshot|screen\s+shot|capture\s+screen|take\s+a\s+screenshot)$",
      lambda d, m: d._screenshot(m)),
 
+    # ───── File ops (Phase 1) — MUST come before the type regex,
+    # because the type regex accepts `write` as an alias and would
+    # swallow `write foo content: bar` into _type_text otherwise.
+    (r"^write\s+(?P<path>\S.+?)\s+content:\s*(?P<content>.*)$",
+     lambda d, m: d._write_file(m.group("path").strip(), m.group("content"))),
+    (r"^append(?:\s+to)?\s+(?P<path>\S.+?)\s+content:\s*(?P<content>.*)$",
+     lambda d, m: d._write_file(m.group("path").strip(),
+                                m.group("content"), append=True)),
+    (r"^delete\s+file\s+(?P<path>.+)$",
+     lambda d, m: d._delete_file(m.group("path").strip())),
+    (r"^(?:make|create)\s+(?:folder|directory|dir)\s+(?P<path>.+)$",
+     lambda d, m: d._mkdir(m.group("path").strip())),
+    (r"^remove\s+(?:folder|directory|dir)\s+(?P<path>.+)$",
+     lambda d, m: d._remove_folder(m.group("path").strip())),
+    (r"^(?:list|ls)\s+(?P<path>.+)$",
+     lambda d, m: d._list_dir(m.group("path").strip())),
+
     # Type text into the focused window. Snippet substitution:
     # `type my email` -> config[snippets][email].
-    (r"^(?:type|write|escribe|escribir)\s+(?P<t>.+)$",
+    # NOTE: `write` is intentionally NOT listed here anymore — it's
+    # now reserved for the file-creation intent above. `escribe`
+    # stays because the LLM normally routes it to `type`, but the
+    # regex fallback should still handle it for offline/direct use.
+    (r"^(?:type|escribe|escribir)\s+(?P<t>.+)$",
      lambda d, m: d._type_text(m.group("t"))),
 
     # Press a single key or combo: `press enter`, `press tab`, `press ctrl a`.
