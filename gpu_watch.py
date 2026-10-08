@@ -61,6 +61,27 @@ DEFAULT_GAME_PROCESSES = {
     # Racing / sims
     "f1_24.exe", "f1_23.exe", "f1_22.exe",
     "forzahorizon5.exe", "forzahorizon4.exe",
+    # Marvel Rivals (several possible process names on win64 builds)
+    "marvel-win64-shipping.exe",
+    "marvelrivals.exe",
+    "marvelrivals_launcher.exe",
+    # Raul's current Steam library (scanned 2026-10-08). The path
+    # hint `steamapps/common` catches these too, but having explicit
+    # names makes the detection O(1) and self-documenting.
+    "spider-man2.exe",                     # Marvel's Spider-Man 2
+    "mtfssteam-win64-shipping.exe",        # MARVEL Tokon: Fighting Souls
+    "symulatorit-win64-shipping.exe",      # ServiceIT: You can do IT
+    "overcooked2.exe",                     # Overcooked! 2
+    "pc creator.exe",                      # PC Building Simulator
+    "among us.exe",                        # Among Us
+    "how to fish.exe",                     # How to Fish
+    "tftclient-win64-shipping.exe",        # Teamfight Tactics
+    "phasmophobia.exe", "phasmo-win64-shipping.exe",  # Phasmophobia (both variants)
+    "warframe.x64.exe", "warframe.exe",    # Warframe
+    "arkascended.exe", "shootergame.exe",  # ARK (Ascended + original UE4)
+    "re4.exe",                             # RE4 Remake Chainsaw Demo
+    "bombanana.exe",                       # BOMBANANA Demo
+    "abinfinite.exe",                      # ABInfinite
 }
 
 DEFAULT_PATH_HINTS = [
