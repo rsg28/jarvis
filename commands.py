@@ -1330,6 +1330,97 @@ class CommandDispatcher:
         return CommandResult(speak=spoken,
                              print_out=f"[ls] {target}\n{printed}")
 
+    # ────────────── screen watch (Phase 6) ──────────────
+    # Pixel-diff only — no vision model. Detects "something changed"
+    # on screen at a configurable interval and alerts via toast +
+    # voice. Deliberately doesn't try to describe WHAT changed; see
+    # commit log for the design rationale.
+
+    def _get_watcher(self):
+        if getattr(self, "_watcher", None) is None:
+            from screen_watch import ScreenWatcher
+            self._watcher = ScreenWatcher(
+                on_change=self._on_screen_change,
+                interval_s=60.0,
+                threshold=15.0,
+            )
+        return self._watcher
+
+    def _on_screen_change(self, activity: float,
+                          count: int, _ts: float) -> None:
+        """Fire a toast + a short spoken alert when the watcher
+        detects significant on-screen activity. Kept intentionally
+        brief so it doesn't interrupt the user's flow."""
+        try:
+            from notify import notify
+            notify(
+                title="Jarvis — screen activity",
+                body=f"Something changed on screen "
+                     f"(activity={activity:.1f}, #{count}).",
+            )
+        except Exception as exc:
+            logging.debug("[watch] toast failed: %s", exc)
+        try:
+            if self.voice is not None:
+                self.voice.say(f"Heads up, something changed on screen.")
+        except Exception as exc:
+            logging.debug("[watch] voice say failed: %s", exc)
+
+    def _watch_start(self, interval_s: Optional[float] = None,
+                     threshold: Optional[float] = None) -> CommandResult:
+        w = self._get_watcher()
+        if interval_s is not None:
+            w.state.interval_s = max(5.0, float(interval_s))
+        if threshold is not None:
+            w.state.threshold = max(1.0, float(threshold))
+        if not w.start():
+            return CommandResult(
+                speak=f"Already watching every "
+                      f"{int(w.state.interval_s)} seconds.",
+                print_out=f"[watch] already running "
+                          f"(interval={w.state.interval_s}s "
+                          f"threshold={w.state.threshold})")
+        return CommandResult(
+            speak=f"Watching the screen every "
+                  f"{int(w.state.interval_s)} seconds. "
+                  f"I'll ping you when something changes.",
+            print_out=f"[watch] started "
+                      f"(interval={w.state.interval_s}s "
+                      f"threshold={w.state.threshold})")
+
+    def _watch_stop(self, _m=None) -> CommandResult:
+        w = self._get_watcher()
+        if not w.stop():
+            return CommandResult(
+                speak="I wasn't watching the screen.",
+                print_out="[watch] not running")
+        return CommandResult(
+            speak=f"Stopped watching. Caught {w.state.change_count} "
+                  f"changes while I was looking.",
+            print_out=f"[watch] stopped "
+                      f"({w.state.change_count} changes recorded)")
+
+    def _watch_status(self, _m=None) -> CommandResult:
+        w = self._get_watcher()
+        s = w.state
+        if not s.running:
+            return CommandResult(
+                speak="Screen watch is off.",
+                print_out="[watch] off")
+        import time as _t
+        age = max(0, int(_t.time() - s.started_at))
+        last = ("never" if not s.last_change_ts
+                else f"{int(_t.time() - s.last_change_ts)}s ago")
+        return CommandResult(
+            speak=f"Watching for {age} seconds. "
+                  f"{s.change_count} changes so far. "
+                  f"Last change: {last}.",
+            print_out=f"[watch] running age={age}s changes={s.change_count} "
+                      f"last_change={last} "
+                      f"interval={s.interval_s}s "
+                      f"threshold={s.threshold} "
+                      f"last_activity={s.last_activity:.1f}")
+
     # ────────────── mouse control (Phase 5) ──────────────
     # Coordinate-based ops via pyautogui. Visual grounding ("click
     # on the login button") would require sending a screenshot to a
@@ -2007,6 +2098,17 @@ INTENTS: list[tuple[str, Callable[["CommandDispatcher", re.Match], CommandResult
     # Find a target without opening it — great for disambiguation.
     (r"^(?:find|locate|where\s+is)\s+(?P<q>.+?)\s*\??$",
      lambda d, m: d._find(m.group("q").strip())),
+
+    # ───── Screen watch (Phase 6) ─────
+    # Pixel-diff daemon. See screen_watch.py for the sampling loop.
+    (r"^watch\s+screen(?:\s+every\s+(?P<n>\d+)\s*(?P<unit>s|sec|secs|seconds?|m|min|mins|minutes?)?)?$",
+     lambda d, m: d._watch_start(
+         interval_s=(int(m.group("n")) * (60 if (m.group("unit") or "s").startswith("m") else 1))
+                    if m.group("n") else None)),
+    (r"^(?:stop\s+watching(?:\s+screen)?|stop\s+screen\s+watch)$",
+     lambda d, m: d._watch_stop(m)),
+    (r"^(?:screen\s+activity|screen\s+watch\s+status|watch\s+status)$",
+     lambda d, m: d._watch_status(m)),
 
     # ───── Mouse control (Phase 5) ─────
     # Coord-based ops only. Visual grounding ("click on the login
