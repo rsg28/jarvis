@@ -106,6 +106,13 @@ Prefer these EXACT phrasings when you emit `call_intent`:
                                  "warm up model", "carga el modelo".
   vram status                    Report which models are resident and how
                                  many megabytes of VRAM they take.
+  gaming mode on                 Arm the auto-watcher: poll processes every
+                                 10 s and auto-release VRAM the moment a known
+                                 game launches. Reloads the model when it
+                                 exits (configurable). On by default on boot.
+  gaming mode off                Stop the auto-watcher. VRAM stays loaded.
+  gaming mode status             Report whether it's armed and the current
+                                 detected game (if any).
   run <cmd> [in <path>]          Execute a shell command. Only allow-listed
                                  tools (git, python, pip, uv, npm, npx, node,
                                  cargo, dotnet, pytest, mypy, ruff, gh, etc.)
@@ -309,6 +316,15 @@ Few-shot examples (follow these EXACTLY):
 
   user: "que modelos tienes cargados?"
   -> {"action":"call_intent","command":"vram status"}
+
+  user: "activa el modo gaming automatico"
+  -> {"action":"call_intent","command":"gaming mode on"}
+
+  user: "apaga el modo gaming"
+  -> {"action":"call_intent","command":"gaming mode off"}
+
+  user: "esta activado el modo gaming?"
+  -> {"action":"call_intent","command":"gaming mode status"}
 
   user: "cual es el estado del watch?"
   -> {"action":"call_intent","command":"screen activity"}

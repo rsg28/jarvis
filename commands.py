@@ -46,6 +46,16 @@ class CommandDispatcher:
         # Re-entrancy guard so an LLM-produced command that also fails to
         # match never triggers another LLM round-trip.
         self._in_llm_dispatch = False
+        # Auto-arm gaming-mode watcher if config says so. Starts the
+        # background process poll immediately so a game launched right
+        # after boot still triggers an auto VRAM release. Failure here
+        # must not block boot — it's an optional convenience.
+        if (config.get("gaming", {}) or {}).get("enabled", False):
+            try:
+                self._get_game_watcher().start()
+                logging.info("[boot] gaming mode auto-armed")
+            except Exception as exc:
+                logging.warning("[boot] gaming mode auto-arm failed: %s", exc)
 
     def _get_kb(self):
         """Lazy KnowledgeBase builder — only hits disk/API when first
@@ -1330,6 +1340,117 @@ class CommandDispatcher:
         return CommandResult(speak=spoken,
                              print_out=f"[ls] {target}\n{printed}")
 
+    # ────────────── auto gaming mode (Phase 8) ──────────────
+    # Background daemon that polls the process list every N seconds.
+    # When a known game appears, auto-releases VRAM. When it closes,
+    # optionally reloads the model so the next voice turn is instant.
+
+    def _get_game_watcher(self):
+        if getattr(self, "_game_watcher", None) is None:
+            from gpu_watch import GameWatcher
+            gc = self.config.get("gaming", {}) or {}
+            self._game_watcher = GameWatcher(
+                on_game_start=self._on_game_start,
+                on_game_stop=self._on_game_stop,
+                poll_s=float(gc.get("poll_seconds", 10.0)),
+                extra_processes=gc.get("game_processes") or [],
+                extra_path_hints=gc.get("game_path_hints") or [],
+                auto_reclaim_on_exit=bool(gc.get("auto_reclaim_on_exit", True)),
+            )
+        return self._game_watcher
+
+    def _on_game_start(self, exe_name: str) -> None:
+        """Fired on the gpu-watch thread when a game launches."""
+        logging.info("[gpu-watch] game detected: %s — releasing VRAM", exe_name)
+        try:
+            r = self._vram_release()
+            freed = r.print_out
+        except Exception as exc:
+            freed = f"release failed: {exc}"
+        try:
+            from notify import notify
+            notify(title="Jarvis — gaming mode",
+                   body=f"Detected {exe_name}, released VRAM for the GPU.")
+        except Exception as exc:
+            logging.debug("[gpu-watch] toast failed: %s", exc)
+        try:
+            if self.voice is not None:
+                self.voice.say(f"Enjoy the game. I released the VRAM.")
+        except Exception as exc:
+            logging.debug("[gpu-watch] voice failed: %s", exc)
+        logging.info("[gpu-watch] release result: %s", freed)
+
+    def _on_game_stop(self, exe_name: str) -> None:
+        """Fired on the gpu-watch thread when the detected game exits."""
+        logging.info("[gpu-watch] game closed: %s", exe_name)
+        gw = self._get_game_watcher()
+        if not gw.state.auto_reclaim_on_exit:
+            try:
+                from notify import notify
+                notify(title="Jarvis — gaming mode",
+                       body=f"{exe_name} closed. VRAM stays free.")
+            except Exception:
+                pass
+            return
+        try:
+            self._vram_reclaim()
+        except Exception as exc:
+            logging.warning("[gpu-watch] reclaim failed: %s", exc)
+        try:
+            from notify import notify
+            notify(title="Jarvis — gaming mode",
+                   body=f"{exe_name} closed. Model reloaded, I'm back.")
+        except Exception:
+            pass
+        try:
+            if self.voice is not None:
+                self.voice.say("Welcome back. I'm ready whenever you are.")
+        except Exception:
+            pass
+
+    def _gaming_on(self, _m=None) -> CommandResult:
+        gw = self._get_game_watcher()
+        if not gw.start():
+            return CommandResult(
+                speak=f"Gaming mode is already on, polling every "
+                      f"{int(gw.state.poll_s)} seconds.",
+                print_out=f"[gpu-watch] already running "
+                          f"(poll={gw.state.poll_s}s)")
+        return CommandResult(
+            speak=f"Gaming mode armed. I'll release the VRAM "
+                  f"the moment a game shows up.",
+            print_out=f"[gpu-watch] armed "
+                      f"(poll={gw.state.poll_s}s, "
+                      f"{len(gw.state.game_processes)} known exes)")
+
+    def _gaming_off(self, _m=None) -> CommandResult:
+        gw = self._get_game_watcher()
+        if not gw.stop():
+            return CommandResult(
+                speak="Gaming mode wasn't on.",
+                print_out="[gpu-watch] not running")
+        return CommandResult(
+            speak="Gaming mode off. VRAM will stay loaded.",
+            print_out="[gpu-watch] disarmed")
+
+    def _gaming_status(self, _m=None) -> CommandResult:
+        gw = self._get_game_watcher()
+        s = gw.state
+        if not s.running:
+            return CommandResult(
+                speak="Gaming mode is off.",
+                print_out="[gpu-watch] off")
+        if s.active_game:
+            spoken = (f"Gaming mode on. Right now you're running "
+                      f"{s.active_game}, so VRAM is released.")
+        else:
+            spoken = (f"Gaming mode on, polling every {int(s.poll_s)} "
+                      f"seconds. No game detected right now.")
+        return CommandResult(
+            speak=spoken,
+            print_out=f"[gpu-watch] on poll={s.poll_s}s checks={s.checks} "
+                      f"detections={s.detections} active={s.active_game}")
+
     # ────────────── VRAM management (Phase 7) ──────────────
     # Ollama keeps the model loaded in VRAM for `keep_alive` after
     # each request (default 5 min). On an 8 GB card that's 6 GB
@@ -1956,6 +2077,10 @@ _CRITICAL_INTENT_PATTERNS = [
     r"^(?:release\s+vram|release\s+gpu|unload\s+model(?:s)?|free\s+vram|free\s+gpu|voy\s+a\s+jugar)$",
     r"^(?:reclaim\s+vram|warm\s+up(?:\s+model)?|wake\s+up|preload\s+model|carga\s+el\s+modelo)$",
     r"^(?:vram\s+status|gpu\s+status|whats?\s+(?:in\s+)?vram|que\s+hay\s+en\s+(?:la\s+)?vram)$",
+    # Gaming-mode toggle — same reason as VRAM: plumbing, not NLP.
+    r"^(?:gaming\s+mode\s+on|arm\s+gaming\s+mode|modo\s+gaming\s+on|activa\s+modo\s+gaming)$",
+    r"^(?:gaming\s+mode\s+off|disarm\s+gaming\s+mode|modo\s+gaming\s+off|apaga\s+modo\s+gaming)$",
+    r"^(?:gaming\s+mode\s+status|modo\s+gaming\s+status|estado\s+(?:del\s+)?modo\s+gaming)$",
 ]
 
 
@@ -2190,6 +2315,14 @@ INTENTS: list[tuple[str, Callable[["CommandDispatcher", re.Match], CommandResult
     # Find a target without opening it — great for disambiguation.
     (r"^(?:find|locate|where\s+is)\s+(?P<q>.+?)\s*\??$",
      lambda d, m: d._find(m.group("q").strip())),
+
+    # ───── Gaming mode (Phase 8) ─────
+    (r"^(?:gaming\s+mode\s+on|arm\s+gaming\s+mode|modo\s+gaming\s+on|activa\s+modo\s+gaming)$",
+     lambda d, m: d._gaming_on(m)),
+    (r"^(?:gaming\s+mode\s+off|disarm\s+gaming\s+mode|modo\s+gaming\s+off|apaga\s+modo\s+gaming)$",
+     lambda d, m: d._gaming_off(m)),
+    (r"^(?:gaming\s+mode\s+status|modo\s+gaming\s+status|estado\s+(?:del\s+)?modo\s+gaming)$",
+     lambda d, m: d._gaming_status(m)),
 
     # ───── VRAM management (Phase 7) ─────
     # Free the GPU for games / wake it back up / check what's resident.
