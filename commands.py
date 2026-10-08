@@ -190,20 +190,26 @@ class CommandDispatcher:
                     used_kb = True
                     logging.info("[kb] grounding reply on %d chunks "
                                  "(top score %.2f)", len(hits), hits[0].score)
-            # Clear-question inputs ("?") still get a nudge toward
-            # chat mode even when no KB chunks matched, because local
-            # models can be over-eager and route "puedo sentar al
-            # paciente?" as `type sentar al paciente` based on surface
-            # word overlap. We ONLY add this nudge when there's an
-            # explicit question mark — ambiguous long inputs like
-            # "revisa si hay nuevo capitulo" should still be allowed
-            # to route to intents.
-            if not used_kb and ("?" in text or "¿" in text):
+            # Chat-forcing nudge: only when the KB has docs loaded AND
+            # the input ends in a "?". That's the scenario where Qwen
+            # historically misrouted ("puedo sentar al paciente?" ->
+            # type sentar al paciente). For a user with no docs loaded,
+            # a "?" might just as well be a short actionable question
+            # like "donde esta el mouse?" that should route to the
+            # mouse_position intent, so we leave normal routing alone.
+            kb_has_docs = False
+            try:
+                kb = self._get_kb()
+                kb_has_docs = kb is not None and bool(kb.docs)
+            except Exception:
+                pass
+            if (not used_kb) and kb_has_docs and ("?" in text or "¿" in text):
                 augmented = (
-                    "The user is asking a free-form question. Respond with "
-                    "{\"action\":\"chat\",\"reply\":...} — a short spoken "
-                    "answer. Do NOT emit call_intent unless the request is "
-                    "unambiguously an app/file/media/system command.\n\n"
+                    "The user is asking a free-form question but no KB "
+                    "excerpts matched. Prefer {\"action\":\"chat\",\"reply\":"
+                    "...} UNLESS the request clearly maps to an app/file/"
+                    "media/system/mouse/shell command — those still route "
+                    "normally.\n\n"
                     f"User: {text}"
                 )
 
@@ -1324,6 +1330,105 @@ class CommandDispatcher:
         return CommandResult(speak=spoken,
                              print_out=f"[ls] {target}\n{printed}")
 
+    # ────────────── mouse control (Phase 5) ──────────────
+    # Coordinate-based ops via pyautogui. Visual grounding ("click
+    # on the login button") would require sending a screenshot to a
+    # vision model each time — deliberately deferred until we pick
+    # a free local vision backend. For now the LLM translates
+    # natural requests into coord-based intents, and the user can
+    # ask "mouse position" to discover coords interactively.
+
+    @staticmethod
+    def _mouse():
+        """Lazy import so pyautogui's import-time X11 probe never
+        runs unless the user actually invokes a mouse intent."""
+        import pyautogui as pag
+        # Disable the top-left-corner failsafe — in a voice workflow
+        # the user shouldn't have to think about where their mouse is.
+        pag.FAILSAFE = False
+        return pag
+
+    def _mouse_pos(self, _match=None) -> CommandResult:
+        try:
+            pag = self._mouse()
+            x, y = pag.position()
+        except Exception as exc:
+            return CommandResult(
+                speak=f"I couldn't read the mouse position: {type(exc).__name__}.",
+                print_out=f"[mouse] pos failed: {exc}")
+        return CommandResult(
+            speak=f"Mouse is at {x}, {y}.",
+            print_out=f"[mouse] position = ({x}, {y})")
+
+    def _mouse_move(self, x: str, y: str) -> CommandResult:
+        try:
+            pag = self._mouse()
+            xi, yi = int(x), int(y)
+            pag.moveTo(xi, yi, duration=0.1)
+        except Exception as exc:
+            return CommandResult(
+                speak=f"Couldn't move: {type(exc).__name__}.",
+                print_out=f"[mouse] move failed: {exc}")
+        return CommandResult(
+            speak=f"Moved to {xi}, {yi}.",
+            print_out=f"[mouse] moveTo({xi}, {yi})")
+
+    def _mouse_click(self, button: str = "left",
+                     x: Optional[str] = None,
+                     y: Optional[str] = None,
+                     clicks: int = 1) -> CommandResult:
+        button = (button or "left").lower()
+        if button not in ("left", "right", "middle"):
+            button = "left"
+        try:
+            pag = self._mouse()
+            if x is not None and y is not None:
+                pag.click(int(x), int(y), clicks=clicks,
+                          button=button, interval=0.05, duration=0.05)
+                where = f"at ({x}, {y})"
+            else:
+                pag.click(clicks=clicks, button=button, interval=0.05)
+                px, py = pag.position()
+                where = f"at ({px}, {py})"
+        except Exception as exc:
+            return CommandResult(
+                speak=f"Click failed: {type(exc).__name__}.",
+                print_out=f"[mouse] click failed: {exc}")
+        verb = "Double-clicked" if clicks == 2 else "Clicked"
+        return CommandResult(
+            speak=f"{verb} {button} {where}.",
+            print_out=f"[mouse] {button} click x{clicks} {where}")
+
+    def _mouse_scroll(self, direction: str, amount: int = 3) -> CommandResult:
+        direction = (direction or "down").lower()
+        steps = int(amount) if amount else 3
+        delta = steps * 120 if direction in ("up", "arriba") else -steps * 120
+        try:
+            pag = self._mouse()
+            pag.scroll(delta)
+        except Exception as exc:
+            return CommandResult(
+                speak=f"Scroll failed: {type(exc).__name__}.",
+                print_out=f"[mouse] scroll failed: {exc}")
+        return CommandResult(
+            speak=f"Scrolled {direction} {steps}.",
+            print_out=f"[mouse] scroll {delta} ({direction} x{steps})")
+
+    def _mouse_drag(self, x1: str, y1: str,
+                    x2: str, y2: str) -> CommandResult:
+        try:
+            pag = self._mouse()
+            a, b, c, d = int(x1), int(y1), int(x2), int(y2)
+            pag.moveTo(a, b, duration=0.1)
+            pag.dragTo(c, d, duration=0.3, button="left")
+        except Exception as exc:
+            return CommandResult(
+                speak=f"Drag failed: {type(exc).__name__}.",
+                print_out=f"[mouse] drag failed: {exc}")
+        return CommandResult(
+            speak=f"Dragged from {a},{b} to {c},{d}.",
+            print_out=f"[mouse] drag ({a},{b}) -> ({c},{d})")
+
     # ────────────── project scaffold (Phase 2) ──────────────
     # Supported stacks: python, node, static (html+css+js), rust.
     # Each produces a sensibly-opinionated starting layout inside
@@ -1902,6 +2007,29 @@ INTENTS: list[tuple[str, Callable[["CommandDispatcher", re.Match], CommandResult
     # Find a target without opening it — great for disambiguation.
     (r"^(?:find|locate|where\s+is)\s+(?P<q>.+?)\s*\??$",
      lambda d, m: d._find(m.group("q").strip())),
+
+    # ───── Mouse control (Phase 5) ─────
+    # Coord-based ops only. Visual grounding ("click on the login
+    # button") will come in a later phase once we pick a vision model.
+    (r"^mouse\s+position$",
+     lambda d, m: d._mouse_pos()),
+    (r"^(?:move\s+(?:mouse\s+)?(?:to\s+)?|move\s+cursor\s+to\s+)"
+     r"(?P<x>-?\d+)[\s,]+(?P<y>-?\d+)$",
+     lambda d, m: d._mouse_move(m.group("x"), m.group("y"))),
+    (r"^(?:double\s*click|dbl\s*click)(?:\s+(?:at\s+)?(?P<x>-?\d+)[\s,]+(?P<y>-?\d+))?$",
+     lambda d, m: d._mouse_click("left", m.group("x"), m.group("y"), clicks=2)),
+    (r"^(?P<btn>left|right|middle)\s+click(?:\s+(?:at\s+)?(?P<x>-?\d+)[\s,]+(?P<y>-?\d+))?$",
+     lambda d, m: d._mouse_click(m.group("btn"), m.group("x"), m.group("y"))),
+    (r"^(?:mouse\s+)?click(?:\s+(?:at\s+)?(?P<x>-?\d+)[\s,]+(?P<y>-?\d+))?$",
+     lambda d, m: d._mouse_click("left", m.group("x"), m.group("y"))),
+    (r"^right\s+click(?:\s+(?:at\s+)?(?P<x>-?\d+)[\s,]+(?P<y>-?\d+))?$",
+     lambda d, m: d._mouse_click("right", m.group("x"), m.group("y"))),
+    (r"^scroll\s+(?P<dir>up|down)(?:\s+(?P<n>\d+))?$",
+     lambda d, m: d._mouse_scroll(m.group("dir"), int(m.group("n") or 3))),
+    (r"^drag\s+(?:from\s+)?(?P<x1>-?\d+)[\s,]+(?P<y1>-?\d+)"
+     r"\s+(?:to\s+)?(?P<x2>-?\d+)[\s,]+(?P<y2>-?\d+)$",
+     lambda d, m: d._mouse_drag(m.group("x1"), m.group("y1"),
+                                m.group("x2"), m.group("y2"))),
 
     # ───── Project scaffold (Phase 2) ─────
     # Canonical: `scaffold <stack> <name>` where stack is one of
