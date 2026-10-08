@@ -1324,6 +1324,320 @@ class CommandDispatcher:
         return CommandResult(speak=spoken,
                              print_out=f"[ls] {target}\n{printed}")
 
+    # ────────────── project scaffold (Phase 2) ──────────────
+    # Supported stacks: python, node, static (html+css+js), rust.
+    # Each produces a sensibly-opinionated starting layout inside
+    # the workspace root (or the user-given absolute path), then
+    # kicks off `git init` so the project is version-controlled
+    # from minute one. Nothing is pushed anywhere.
+
+    _SCAFFOLD_STACKS = {"python", "node", "static", "rust"}
+
+    def _scaffold_project(self, stack: str, name: str) -> CommandResult:
+        stack = (stack or "").strip().lower()
+        name = (name or "").strip().strip('"').strip("'")
+        if stack not in self._SCAFFOLD_STACKS:
+            return CommandResult(
+                speak=f"I don't know the {stack} stack. I can do "
+                      f"python, node, static, or rust.",
+                print_out=f"[scaffold] unsupported stack: {stack}")
+        if not name:
+            return CommandResult(speak="What should I call the project?",
+                                 print_out="[scaffold] no name")
+
+        # Normalise name: lower-snake for python/rust, lower-kebab elsewhere.
+        import re as _re
+        safe_name = _re.sub(r"[^a-z0-9_-]+", "-", name.lower()).strip("-_")
+        if not safe_name:
+            return CommandResult(speak=f"'{name}' isn't a usable project name.",
+                                 print_out=f"[scaffold] empty safe name")
+        snake = safe_name.replace("-", "_")
+
+        root = self._resolve_user_path(safe_name)
+        if root.exists() and any(root.iterdir()):
+            return CommandResult(
+                speak=f"{safe_name} already exists and isn't empty. "
+                      f"Pick another name or remove it first.",
+                print_out=f"[scaffold] refuse non-empty dir: {root}")
+        root.mkdir(parents=True, exist_ok=True)
+
+        # ── Write stack-specific files ──
+        files: dict[str, str] = {}
+        if stack == "python":
+            files["README.md"] = (
+                f"# {safe_name}\n\n"
+                f"Scaffolded by Jarvis.\n\n"
+                f"## Quickstart\n\n"
+                f"    python -m venv .venv\n"
+                f"    .venv\\Scripts\\activate\n"
+                f"    pip install -e .[dev]\n"
+                f"    pytest -q\n")
+            files[".gitignore"] = (
+                "__pycache__/\n*.pyc\n.venv/\nvenv/\n.env\n"
+                ".pytest_cache/\n.mypy_cache/\nbuild/\ndist/\n*.egg-info/\n")
+            files[f"src/{snake}/__init__.py"] = (
+                f'"""{safe_name} package."""\n__version__ = "0.1.0"\n')
+            files[f"src/{snake}/main.py"] = (
+                "def main() -> None:\n"
+                f'    print("hello from {safe_name}")\n\n\n'
+                'if __name__ == "__main__":\n    main()\n')
+            files[f"tests/test_{snake}.py"] = (
+                f"from {snake} import __version__\n\n\n"
+                "def test_version():\n"
+                '    assert __version__ == "0.1.0"\n')
+            files["pyproject.toml"] = (
+                f'[project]\n'
+                f'name = "{safe_name}"\n'
+                f'version = "0.1.0"\n'
+                f'description = "Scaffolded by Jarvis."\n'
+                f'requires-python = ">=3.10"\n'
+                f'dependencies = []\n\n'
+                f'[project.optional-dependencies]\n'
+                f'dev = ["pytest"]\n\n'
+                f'[build-system]\n'
+                f'requires = ["setuptools>=61"]\n'
+                f'build-backend = "setuptools.build_meta"\n\n'
+                f'[tool.setuptools.packages.find]\n'
+                f'where = ["src"]\n')
+        elif stack == "node":
+            files["README.md"] = (
+                f"# {safe_name}\n\nScaffolded by Jarvis.\n\n"
+                f"## Quickstart\n\n    npm install\n    npm start\n")
+            files[".gitignore"] = (
+                "node_modules/\ndist/\nbuild/\n.env\n*.log\n.DS_Store\n")
+            files["package.json"] = (
+                '{\n'
+                f'  "name": "{safe_name}",\n'
+                '  "version": "0.1.0",\n'
+                '  "description": "Scaffolded by Jarvis.",\n'
+                '  "type": "module",\n'
+                '  "main": "src/index.js",\n'
+                '  "scripts": {\n'
+                '    "start": "node src/index.js",\n'
+                '    "test": "node --test"\n'
+                '  }\n'
+                '}\n')
+            files["src/index.js"] = (
+                f'console.log("hello from {safe_name}");\n')
+        elif stack == "static":
+            files["README.md"] = (
+                f"# {safe_name}\n\nStatic site scaffolded by Jarvis.\n\n"
+                f"Open `index.html` in a browser, or serve with "
+                f"`python -m http.server 8000`.\n")
+            files[".gitignore"] = ".DS_Store\n*.log\n.vscode/\n"
+            files["index.html"] = (
+                '<!doctype html>\n<html lang="en">\n<head>\n'
+                '  <meta charset="utf-8">\n'
+                '  <meta name="viewport" content="width=device-width,initial-scale=1">\n'
+                f'  <title>{safe_name}</title>\n'
+                '  <link rel="stylesheet" href="style.css">\n'
+                '</head>\n<body>\n'
+                f'  <h1>{safe_name}</h1>\n'
+                '  <p>Hello world.</p>\n'
+                '  <script src="script.js"></script>\n'
+                '</body>\n</html>\n')
+            files["style.css"] = (
+                ":root { color-scheme: light dark; }\n"
+                "body { font-family: system-ui, sans-serif; "
+                "max-width: 60ch; margin: 4rem auto; padding: 0 1rem; }\n")
+            files["script.js"] = (
+                f'console.log("{safe_name} loaded");\n')
+        elif stack == "rust":
+            # We don't scaffold Cargo.toml by hand — `cargo new` does
+            # it correctly. We only need the parent dir to exist and
+            # be empty. shell_exec call below handles it.
+            files["README.md"] = (
+                f"# {safe_name}\n\nScaffolded by Jarvis (via `cargo new`).\n\n"
+                f"## Quickstart\n\n    cargo run\n    cargo test\n")
+
+        try:
+            for rel, content in files.items():
+                dest = root / rel
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                dest.write_text(content, encoding="utf-8", newline="\n")
+        except Exception as exc:
+            return CommandResult(
+                speak=f"I started the project but hit an error writing files: "
+                      f"{type(exc).__name__}.",
+                print_out=f"[scaffold] write error: {exc}")
+
+        # ── Rust: delegate layout to cargo ──
+        if stack == "rust":
+            import subprocess
+            try:
+                subprocess.run(
+                    ["cargo", "init", "--name", safe_name, "."],
+                    cwd=str(root), capture_output=True, text=True,
+                    timeout=30, shell=False, encoding="utf-8", errors="replace")
+            except Exception as exc:
+                logging.warning("[scaffold] cargo init failed: %s", exc)
+
+        # ── git init (best-effort; silent on failure) ──
+        import subprocess
+        try:
+            subprocess.run(
+                ["git", "init", "-q"],
+                cwd=str(root), capture_output=True, text=True,
+                timeout=15, shell=False, encoding="utf-8", errors="replace")
+            subprocess.run(
+                ["git", "add", "-A"],
+                cwd=str(root), capture_output=True, text=True,
+                timeout=15, shell=False, encoding="utf-8", errors="replace")
+            subprocess.run(
+                ["git", "commit", "-q", "-m", "Initial scaffold by Jarvis"],
+                cwd=str(root), capture_output=True, text=True,
+                timeout=15, shell=False, encoding="utf-8", errors="replace")
+        except Exception as exc:
+            logging.warning("[scaffold] git init chain failed: %s", exc)
+
+        n_files = sum(1 for _ in root.rglob("*") if _.is_file())
+        return CommandResult(
+            speak=f"{stack.capitalize()} project {safe_name} is ready in "
+                  f"your workspace, {n_files} files, git initialised.",
+            print_out=f"[scaffold] {stack} {root} ({n_files} files)")
+
+    # ────────────── shell exec (Phase 3) ──────────────
+    # Safety model
+    # ------------
+    # * Allow-list of first-word tools (git, python, npm, uv, pip,
+    #   cargo, node, pytest, gh, cmake, make, dotnet). Anything else
+    #   is refused with a clear reason.
+    # * Hard deny-list on substrings that could brick the box
+    #   (rm -rf /, shutdown, format, sc delete, reg delete, Remove-Item -Recurse).
+    # * Default cwd is the workspace root so projects stay contained.
+    #   An explicit "in <path>" suffix lets the user target elsewhere.
+    # * 60s wall-clock timeout. Stdout + stderr truncated for the
+    #   spoken summary; full text goes to the printed log.
+
+    _SHELL_ALLOW = {
+        "git", "gh", "python", "python3", "py", "pip", "uv",
+        "npm", "npx", "yarn", "pnpm", "node",
+        "cargo", "rustc",
+        "dotnet", "cmake", "make", "ninja",
+        "pytest", "mypy", "ruff", "black", "flake8",
+        "go", "deno", "bun",
+    }
+
+    _SHELL_DENY_SUBSTR = (
+        "rm -rf /", "rm -rf ~", "rm -rf *",
+        "shutdown", "reboot", "halt",
+        "format ", "mkfs",
+        "sc delete", "reg delete", "reg add",
+        "del /s", "del /f", "rmdir /s",
+        "remove-item -recurse", "remove-item -force",
+        ":(){:|:&};:",            # classic fork-bomb
+        "mkpart", "fdisk",
+        "chmod -r 777 /",
+    )
+
+    def _run_shell(self, raw: str) -> CommandResult:
+        """Execute a shell command after allow/deny-list checks.
+
+        The caller's phrasing can be like:
+          run git status
+          run python -m pytest -q in C:\\code\\project
+          run npm install
+        """
+        import subprocess, shlex
+        raw = (raw or "").strip()
+        if not raw:
+            return CommandResult(speak="Run what?",
+                                 print_out="[shell] empty command")
+
+        # Optional "in <path>" suffix to override cwd.
+        cwd = self._workspace_root()
+        low = raw.lower()
+        if " in " in low:
+            # Split on the last " in " to keep paths with spaces intact.
+            idx = low.rfind(" in ")
+            maybe_cmd, maybe_cwd = raw[:idx], raw[idx + 4:].strip()
+            if maybe_cwd:
+                p = Path(maybe_cwd).expanduser()
+                if not p.is_absolute():
+                    p = self._workspace_root() / p
+                if p.exists() and p.is_dir():
+                    raw = maybe_cmd.strip()
+                    cwd = p
+
+        # Deny-list substring check (case-insensitive).
+        low = raw.lower()
+        for bad in self._SHELL_DENY_SUBSTR:
+            if bad in low:
+                return CommandResult(
+                    speak=f"I won't run that — it contains {bad!r} "
+                          f"which can destroy data.",
+                    print_out=f"[shell] denied: {bad!r} in {raw!r}")
+
+        # First-word allow-list check.
+        try:
+            parts = shlex.split(raw, posix=False)
+        except ValueError as exc:
+            return CommandResult(
+                speak=f"I can't parse that command: {exc}.",
+                print_out=f"[shell] parse error: {exc}")
+        if not parts:
+            return CommandResult(speak="Run what?",
+                                 print_out="[shell] empty after parse")
+        tool = parts[0].lower().replace(".exe", "")
+        if tool not in self._SHELL_ALLOW:
+            allowed = ", ".join(sorted(self._SHELL_ALLOW))
+            return CommandResult(
+                speak=f"I can only run allow-listed tools. "
+                      f"{tool} isn't on the list.",
+                print_out=f"[shell] denied non-allowlisted tool "
+                          f"{tool!r}. Allowed: {allowed}")
+
+        # Execute.
+        try:
+            proc = subprocess.run(
+                parts,
+                cwd=str(cwd),
+                capture_output=True,
+                text=True,
+                timeout=60,
+                shell=False,
+                encoding="utf-8",
+                errors="replace",
+            )
+        except subprocess.TimeoutExpired:
+            return CommandResult(
+                speak=f"{tool} timed out after 60 seconds.",
+                print_out=f"[shell] timeout: {raw}")
+        except FileNotFoundError:
+            return CommandResult(
+                speak=f"{tool} isn't installed, or isn't on PATH.",
+                print_out=f"[shell] not found: {tool}")
+        except Exception as exc:
+            return CommandResult(
+                speak=f"I couldn't run {tool}: {type(exc).__name__}.",
+                print_out=f"[shell] {raw}: {exc}")
+
+        stdout = (proc.stdout or "").strip()
+        stderr = (proc.stderr or "").strip()
+        ok = proc.returncode == 0
+        # Spoken summary: short. Printed: full streams.
+        summary_src = stdout or stderr or "(no output)"
+        first_line = summary_src.splitlines()[0] if summary_src else "(no output)"
+        if ok:
+            spoken = f"{tool} finished. {first_line[:140]}"
+        else:
+            spoken = (f"{tool} exited with code {proc.returncode}. "
+                      f"{(stderr.splitlines()[0] if stderr else first_line)[:140]}")
+        printed_lines = [
+            f"[shell] cwd={cwd}",
+            f"[shell] $ {raw}",
+            f"[shell] exit={proc.returncode}",
+        ]
+        if stdout:
+            printed_lines.append("[shell] stdout:")
+            printed_lines.append(stdout if len(stdout) < 4000
+                                 else stdout[:4000] + "\n... (truncated)")
+        if stderr:
+            printed_lines.append("[shell] stderr:")
+            printed_lines.append(stderr if len(stderr) < 4000
+                                 else stderr[:4000] + "\n... (truncated)")
+        return CommandResult(speak=spoken, print_out="\n".join(printed_lines))
+
     def _quit(self, _match) -> CommandResult:
         return CommandResult(speak="Signing off. Have a productive day.",
                              print_out="[jarvis] goodbye", should_exit=True)
@@ -1589,8 +1903,24 @@ INTENTS: list[tuple[str, Callable[["CommandDispatcher", re.Match], CommandResult
     (r"^(?:find|locate|where\s+is)\s+(?P<q>.+?)\s*\??$",
      lambda d, m: d._find(m.group("q").strip())),
 
+    # ───── Project scaffold (Phase 2) ─────
+    # Canonical: `scaffold <stack> <name>` where stack is one of
+    # python / node / static / rust. Creates a sensible starting
+    # layout in the workspace, then runs git init.
+    (r"^scaffold\s+(?P<stack>python|node|static|rust)\s+(?P<name>.+)$",
+     lambda d, m: d._scaffold_project(m.group("stack"), m.group("name").strip())),
+
+    # ───── Shell exec (Phase 3) ─────
+    # Canonical: `run <cmd> [in <path>]`. Allow-listed tools only
+    # (git/python/npm/uv/cargo/node/gh/...). The LLM translates
+    # natural phrasings into this shape. Must come before the generic
+    # `open|launch|start|run <app>` catch-all so "run pytest" doesn't
+    # try to launch pytest.exe as an app.
+    (r"^(?:run|exec|execute)\s+(?P<cmd>.+)$",
+     lambda d, m: d._run_shell(m.group("cmd").strip())),
+
     # App / file / folder / URL launcher — MUST come after the specific commands above.
-    (r"^(?:open|launch|start|run)\s+(?P<app>.+)$",
+    (r"^(?:open|launch|start)\s+(?P<app>.+)$",
      lambda d, m: d._open_app(m.group("app").strip())),
 
     # Search
