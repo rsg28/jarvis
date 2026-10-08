@@ -56,6 +56,15 @@ class OllamaLLM:
         self.last_error: Optional[str] = None
         self._cache: Dict[str, Tuple[float, Dict]] = {}
         self._cache_ttl: float = 600.0
+        # keep_alive controls how long Ollama keeps the model warm in
+        # VRAM after each request. Values Ollama accepts:
+        #   "5m"  -> keep loaded 5 minutes after last use
+        #   "0"   -> unload immediately after each request
+        #   "-1m" -> keep loaded forever
+        # Default matches Ollama's own 5-min idle unload so VRAM gets
+        # freed automatically between bursts without constant reloads
+        # (which cost ~40s each). Set via [llm].ollama_keep_alive.
+        self.keep_alive: str = "5m"
 
     # ─────────────────── public ───────────────────
     def infer(self, user_text: str) -> Optional[Dict]:
@@ -89,6 +98,7 @@ class OllamaLLM:
             # Ollama's "format": "json" guarantees the reply parses as
             # JSON — no need for our regex-based rescue layer.
             "format": "json",
+            "keep_alive": self.keep_alive,
             "options": {
                 "temperature": self.temperature,
                 "num_predict": 1024,
@@ -149,6 +159,15 @@ class OllamaLLM:
 
         # format=json should guarantee JSON but models occasionally
         # still emit prose. Promote to chat so the user hears something.
+        # Guard: a reply that's just "{}" / "{...}" / "[]" is garbage
+        # (Qwen does this during cold-start after an unload). Treat
+        # as failure so the dispatcher falls back to regex instead of
+        # speaking "{}" out loud.
+        stripped = content.strip()
+        if stripped in ("{}", "[]", "null", "{\"}") or len(stripped) < 3:
+            self.last_error = ("the local model returned garbage — it may "
+                               "still be warming up after an unload")
+            return None
         promoted = {"action": "chat", "reply": content[:600]}
         if self._cache_ttl > 0:
             self._cache[cache_key] = (now, promoted)
@@ -181,6 +200,66 @@ class OllamaLLM:
             except Exception:
                 return None
         return None
+
+
+# ─────────────────── VRAM management ───────────────────
+def list_loaded(host: str = DEFAULT_HOST,
+                timeout: float = 5.0) -> List[Dict]:
+    """Return the list of currently-loaded models from /api/ps.
+    Each entry has at least: name, size, size_vram, expires_at."""
+    host = host.rstrip("/")
+    req = urllib.request.Request(f"{host}/api/ps", method="GET")
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        body = json.loads(resp.read())
+    return body.get("models") or []
+
+
+def unload(model: str, host: str = DEFAULT_HOST,
+           timeout: float = 10.0) -> bool:
+    """Force Ollama to unload `model` from VRAM NOW.
+    Done by posting an empty generate request with keep_alive=0:
+    Ollama interprets that as "flush this model after responding
+    (which is instantly because there's no prompt to generate)".
+    Returns True if the model is gone from /api/ps afterwards."""
+    host = host.rstrip("/")
+    payload = {"model": model, "prompt": "", "keep_alive": 0, "stream": False}
+    req = urllib.request.Request(
+        f"{host}/api/generate",
+        data=json.dumps(payload).encode("utf-8"),
+        method="POST",
+        headers={"Content-Type": "application/json"})
+    try:
+        urllib.request.urlopen(req, timeout=timeout).read()
+    except Exception as exc:
+        logging.warning("[ollama] unload request failed: %s", exc)
+        return False
+    # Verify: it may take a split second for /api/ps to reflect it.
+    try:
+        loaded = list_loaded(host=host, timeout=2.0)
+    except Exception:
+        return True  # assume success if we can't verify
+    return not any(m.get("name", "").split(":")[0] == model.split(":")[0]
+                   for m in loaded)
+
+
+def warmup(model: str, host: str = DEFAULT_HOST,
+           keep_alive: str = "5m", timeout: float = 60.0) -> bool:
+    """Load `model` into VRAM proactively with a trivial request so
+    the first real inference doesn't eat the 20-40 s cold-start."""
+    host = host.rstrip("/")
+    payload = {"model": model, "prompt": "", "keep_alive": keep_alive,
+               "stream": False}
+    req = urllib.request.Request(
+        f"{host}/api/generate",
+        data=json.dumps(payload).encode("utf-8"),
+        method="POST",
+        headers={"Content-Type": "application/json"})
+    try:
+        urllib.request.urlopen(req, timeout=timeout).read()
+        return True
+    except Exception as exc:
+        logging.warning("[ollama] warmup failed: %s", exc)
+        return False
 
 
 # ─────────────────── embeddings (used by knowledge.py) ───────────────────
@@ -225,5 +304,6 @@ def build_from_config(config: dict) -> Optional[OllamaLLM]:
         history_size=int(llm_cfg.get("history_size", 5)),
     )
     inst._cache_ttl = float(llm_cfg.get("cache_seconds", 600.0))
+    inst.keep_alive = str(llm_cfg.get("ollama_keep_alive", "5m"))
     config["_llm_disabled_reason"] = None
     return inst

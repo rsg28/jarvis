@@ -96,6 +96,16 @@ Prefer these EXACT phrasings when you emit `call_intent`:
   stop watching                  Stop the screen watch daemon.
   screen activity                Report how long it's been watching, how many
                                  changes caught, and when the last was.
+  release vram                   Force-unload the local LLM from VRAM so the
+                                 GPU is free for games or heavy GPU work.
+                                 The next voice turn will pay a 20-40 s
+                                 reload cost. Aliases: "release gpu",
+                                 "unload model", "voy a jugar".
+  reclaim vram                   Reload the model proactively so the next
+                                 voice turn is instant. Aliases: "wake up",
+                                 "warm up model", "carga el modelo".
+  vram status                    Report which models are resident and how
+                                 many megabytes of VRAM they take.
   run <cmd> [in <path>]          Execute a shell command. Only allow-listed
                                  tools (git, python, pip, uv, npm, npx, node,
                                  cargo, dotnet, pytest, mypy, ruff, gh, etc.)
@@ -290,6 +300,15 @@ Few-shot examples (follow these EXACTLY):
 
   user: "deja de vigilar"
   -> {"action":"call_intent","command":"stop watching"}
+
+  user: "voy a jugar un rato, libera la vram"
+  -> {"action":"call_intent","command":"release vram"}
+
+  user: "ya termine de jugar, carga el modelo"
+  -> {"action":"call_intent","command":"reclaim vram"}
+
+  user: "que modelos tienes cargados?"
+  -> {"action":"call_intent","command":"vram status"}
 
   user: "cual es el estado del watch?"
   -> {"action":"call_intent","command":"screen activity"}

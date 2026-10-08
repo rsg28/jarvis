@@ -1330,6 +1330,93 @@ class CommandDispatcher:
         return CommandResult(speak=spoken,
                              print_out=f"[ls] {target}\n{printed}")
 
+    # ────────────── VRAM management (Phase 7) ──────────────
+    # Ollama keeps the model loaded in VRAM for `keep_alive` after
+    # each request (default 5 min). On an 8 GB card that's 6 GB
+    # borrowed, which chokes most games. These handlers let the user
+    # manually release/reclaim VRAM by voice when switching contexts.
+
+    def _vram_release(self, _m=None) -> CommandResult:
+        """Force Ollama to unload the chat model (and the embed model
+        if it's resident). After this, the first new inference will
+        pay the cold-start cost (~20-40 s) to reload."""
+        try:
+            from llm_ollama import unload, list_loaded
+        except Exception as exc:
+            return CommandResult(
+                speak="VRAM control only works with the Ollama backend.",
+                print_out=f"[vram] import failed: {exc}")
+        llm_cfg = self.config.get("llm", {}) or {}
+        host = llm_cfg.get("ollama_host", "http://localhost:11434")
+        try:
+            before = list_loaded(host=host)
+        except Exception as exc:
+            return CommandResult(
+                speak=f"I couldn't reach Ollama: {type(exc).__name__}.",
+                print_out=f"[vram] list_loaded failed: {exc}")
+        if not before:
+            return CommandResult(
+                speak="No models are loaded right now. Your GPU is free.",
+                print_out="[vram] nothing to unload")
+        names = [m.get("name", "?") for m in before]
+        freed_mb = sum(int(m.get("size_vram", 0)) for m in before) // (1024 * 1024)
+        for name in names:
+            unload(name, host=host)
+        return CommandResult(
+            speak=f"Released about {freed_mb} megabytes of VRAM. "
+                  f"{len(names)} model{'s' if len(names) != 1 else ''} unloaded.",
+            print_out=f"[vram] unloaded {names} (freed ~{freed_mb} MB)")
+
+    def _vram_reclaim(self, _m=None) -> CommandResult:
+        """Proactively reload the chat model so the next voice turn
+        responds instantly instead of waiting 20-40 s for cold start."""
+        try:
+            from llm_ollama import warmup
+        except Exception as exc:
+            return CommandResult(
+                speak="VRAM control only works with the Ollama backend.",
+                print_out=f"[vram] import failed: {exc}")
+        llm_cfg = self.config.get("llm", {}) or {}
+        host  = llm_cfg.get("ollama_host",  "http://localhost:11434")
+        model = llm_cfg.get("ollama_model", "qwen2.5:7b-instruct")
+        keep  = llm_cfg.get("ollama_keep_alive", "5m")
+        ok = warmup(model, host=host, keep_alive=keep)
+        if not ok:
+            return CommandResult(
+                speak=f"I couldn't warm up {model}. Is Ollama running?",
+                print_out=f"[vram] warmup failed for {model}")
+        return CommandResult(
+            speak=f"{model.split(':')[0]} is loaded and ready.",
+            print_out=f"[vram] warmed {model} (keep_alive={keep})")
+
+    def _vram_status(self, _m=None) -> CommandResult:
+        """Report what's currently resident in VRAM via /api/ps."""
+        try:
+            from llm_ollama import list_loaded
+        except Exception as exc:
+            return CommandResult(
+                speak="VRAM status only works with the Ollama backend.",
+                print_out=f"[vram] import failed: {exc}")
+        llm_cfg = self.config.get("llm", {}) or {}
+        host = llm_cfg.get("ollama_host", "http://localhost:11434")
+        try:
+            loaded = list_loaded(host=host)
+        except Exception as exc:
+            return CommandResult(
+                speak=f"I couldn't reach Ollama: {type(exc).__name__}.",
+                print_out=f"[vram] list_loaded failed: {exc}")
+        if not loaded:
+            return CommandResult(
+                speak="No models in VRAM. GPU is free for games.",
+                print_out="[vram] nothing loaded")
+        total_mb = sum(int(m.get("size_vram", 0)) for m in loaded) // (1024 * 1024)
+        names = ", ".join(m.get("name", "?") for m in loaded)
+        return CommandResult(
+            speak=f"{len(loaded)} model{'s' if len(loaded) != 1 else ''} "
+                  f"loaded, using about {total_mb} megabytes of VRAM. "
+                  f"{names}.",
+            print_out=f"[vram] {len(loaded)} loaded, {total_mb} MB VRAM: {names}")
+
     # ────────────── screen watch (Phase 6) ──────────────
     # Pixel-diff only — no vision model. Detects "something changed"
     # on screen at a configurable interval and alerts via toast +
@@ -1864,6 +1951,11 @@ _CRITICAL_INTENT_PATTERNS = [
     r"^(?:volume\s+up|louder|sube\s+(?:el\s+)?volumen)(?:\s+\d+)?$",
     r"^(?:volume\s+down|quieter|baja\s+(?:el\s+)?volumen)(?:\s+\d+)?$",
     r"^(?:mute|unmute|silencio)$",
+    # VRAM management — these are plumbing, not NLP, and must work
+    # even when the LLM is unloaded (which is the whole point).
+    r"^(?:release\s+vram|release\s+gpu|unload\s+model(?:s)?|free\s+vram|free\s+gpu|voy\s+a\s+jugar)$",
+    r"^(?:reclaim\s+vram|warm\s+up(?:\s+model)?|wake\s+up|preload\s+model|carga\s+el\s+modelo)$",
+    r"^(?:vram\s+status|gpu\s+status|whats?\s+(?:in\s+)?vram|que\s+hay\s+en\s+(?:la\s+)?vram)$",
 ]
 
 
@@ -2098,6 +2190,15 @@ INTENTS: list[tuple[str, Callable[["CommandDispatcher", re.Match], CommandResult
     # Find a target without opening it — great for disambiguation.
     (r"^(?:find|locate|where\s+is)\s+(?P<q>.+?)\s*\??$",
      lambda d, m: d._find(m.group("q").strip())),
+
+    # ───── VRAM management (Phase 7) ─────
+    # Free the GPU for games / wake it back up / check what's resident.
+    (r"^(?:release\s+vram|release\s+gpu|unload\s+model(?:s)?|free\s+vram|free\s+gpu|voy\s+a\s+jugar)$",
+     lambda d, m: d._vram_release(m)),
+    (r"^(?:reclaim\s+vram|warm\s+up(?:\s+model)?|wake\s+up|preload\s+model|carga\s+el\s+modelo)$",
+     lambda d, m: d._vram_reclaim(m)),
+    (r"^(?:vram\s+status|gpu\s+status|whats?\s+(?:in\s+)?vram|que\s+hay\s+en\s+(?:la\s+)?vram)$",
+     lambda d, m: d._vram_status(m)),
 
     # ───── Screen watch (Phase 6) ─────
     # Pixel-diff daemon. See screen_watch.py for the sampling loop.
