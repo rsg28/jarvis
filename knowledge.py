@@ -43,12 +43,18 @@ EMBED_MODEL = "gemini-embedding-001"
 # Model's native dim is 3072. We request 768 via outputDimensionality
 # to keep the JSON store ~4x smaller — plenty of resolution for RAG
 # over personal documents, and faster cosine-sim at query time.
+# NOTE: ollama's nomic-embed-text is also 768-dim so switching backends
+# doesn't invalidate any pre-existing vectors of the same length.
 EMBED_DIM = 768
 STORE_FILENAME = "knowledge_store.json"
 DEFAULT_CHUNK_SIZE = 900     # chars
 DEFAULT_CHUNK_OVERLAP = 150
 MAX_CHUNKS_WARN = 2000
-SIM_THRESHOLD = 0.55         # cosine-sim floor for "relevant enough"
+SIM_THRESHOLD = 0.45         # cosine-sim floor for "relevant enough"
+# NOTE: local embed models (nomic-embed-text) tend to score ~0.1
+# lower than Gemini's for the same semantic pair, so we start a bit
+# more permissive. The LLM's "answer only from excerpts, don't invent"
+# instruction prevents false-positives from this looser threshold.
 TOP_K = 4
 
 
@@ -175,13 +181,36 @@ class EmbeddingError(RuntimeError):
     pass
 
 
-def embed_batch(texts: List[str], *, api_key: str,
-                timeout: float = 20.0) -> np.ndarray:
-    """Embed a list of strings. Gemini's embedContent endpoint takes
-    one text at a time, so we loop. For 50-chunk docs this is still
-    one burst of fast calls — no rate-limit worry for personal use."""
+def embed_batch(texts: List[str], *, api_key: str = "",
+                backend: str = "gemini",
+                ollama_host: str = "http://localhost:11434",
+                ollama_model: str = "nomic-embed-text",
+                timeout: float = 30.0) -> np.ndarray:
+    """Embed a list of strings. Routes to the right backend:
+      backend='gemini'  → gemini-embedding-001 REST, 768-dim via
+                          outputDimensionality. Needs an api_key.
+      backend='ollama'  → local nomic-embed-text (or whatever model
+                          name is passed), 768-dim native, zero RPM.
+    Returns a (len(texts), EMBED_DIM) float32 matrix."""
     if not texts:
         return np.zeros((0, EMBED_DIM), dtype=np.float32)
+
+    if backend == "ollama":
+        import llm_ollama as _ol
+        try:
+            vecs = _ol.embed(texts, model=ollama_model,
+                             host=ollama_host, timeout=timeout)
+        except Exception as exc:
+            raise EmbeddingError(
+                f"local embed failed via Ollama ({ollama_model}): {exc}") from exc
+        if any(len(v) != EMBED_DIM for v in vecs):
+            got = {len(v) for v in vecs}
+            raise EmbeddingError(
+                f"ollama returned vectors with wrong dim: {got} "
+                f"(expected {EMBED_DIM}). Try `ollama pull nomic-embed-text`.")
+        return np.asarray(vecs, dtype=np.float32)
+
+    # Gemini (default)
     url = (f"https://generativelanguage.googleapis.com/v1beta/"
            f"models/{EMBED_MODEL}:embedContent?key={api_key}")
     out = np.zeros((len(texts), EMBED_DIM), dtype=np.float32)
@@ -233,16 +262,25 @@ class KnowledgeBase:
     """In-memory index + JSON persistence. Load once at dispatcher init,
     mutate during ingest/forget, flush on each mutation."""
     store_path: Path
-    api_key: str
+    api_key: str = ""
+    backend: str = "gemini"
+    ollama_host:  str = "http://localhost:11434"
+    ollama_model: str = "nomic-embed-text"
     docs: dict = field(default_factory=dict)
     # Matrix built lazily — invalidated on any mutation.
     _matrix: Optional[np.ndarray] = None
     _rows: List[Tuple[str, int]] = field(default_factory=list)
 
+    def _embed(self, texts: List[str]) -> np.ndarray:
+        return embed_batch(texts, api_key=self.api_key, backend=self.backend,
+                           ollama_host=self.ollama_host,
+                           ollama_model=self.ollama_model)
+
     # ── persistence ──
     @classmethod
-    def load(cls, store_path: Path, api_key: str) -> "KnowledgeBase":
-        kb = cls(store_path=store_path, api_key=api_key)
+    def load(cls, store_path: Path, api_key: str = "", **kwargs
+             ) -> "KnowledgeBase":
+        kb = cls(store_path=store_path, api_key=api_key, **kwargs)
         if store_path.exists():
             try:
                 data = json.loads(store_path.read_text(encoding="utf-8"))
@@ -294,7 +332,7 @@ class KnowledgeBase:
         if len(chunks) > MAX_CHUNKS_WARN:
             logging.warning("[kb] %d chunks for %s — this will take a bit",
                             len(chunks), path.name)
-        vecs = embed_batch(chunks, api_key=self.api_key)
+        vecs = self._embed(chunks)
         doc_key = path.name
         self.docs[doc_key] = {
             "path": str(path),
@@ -351,7 +389,7 @@ class KnowledgeBase:
             self._build_matrix()
         if self._matrix is None or self._matrix.shape[0] == 0:
             return []
-        q = embed_batch([query], api_key=self.api_key)[0]
+        q = self._embed([query])[0]
         qn = q / (np.linalg.norm(q) or 1.0)
         scores = self._matrix @ qn    # cosine similarity
         order = np.argsort(-scores)[:max(k, 1)]
@@ -370,15 +408,31 @@ class KnowledgeBase:
 
 # ────────────────────── factory ──────────────────────
 def build_from_config(config: dict) -> Optional[KnowledgeBase]:
-    """Return a KB iff LLM is configured (embeddings share the same API
-    key). Returns None otherwise so callers can gracefully skip."""
+    """Return a KB wired to the right embedding backend.
+      backend='ollama' (local)  → no api_key needed; just needs the
+                                   Ollama service running + the embed
+                                   model pulled. Zero rate limits.
+      backend='gemini'          → needs llm.api_key / GEMINI_API_KEY.
+    Returns None only if the backend genuinely can't work (no key
+    for gemini, which is the only hard requirement)."""
     llm_cfg = config.get("llm") or {}
+    backend = str(llm_cfg.get("backend", "gemini")).lower()
+    config_dir = Path(config.get("_config_dir", "."))
+    store_path = config_dir / STORE_FILENAME
+
+    if backend == "ollama":
+        return KnowledgeBase.load(
+            store_path,
+            backend="ollama",
+            ollama_host=llm_cfg.get("ollama_host", "http://localhost:11434"),
+            ollama_model=llm_cfg.get("ollama_embed_model", "nomic-embed-text"),
+        )
+
     api_key = llm_cfg.get("api_key") or os.environ.get("GEMINI_API_KEY", "")
     api_key = (api_key or "").strip()
     if not api_key:
         return None
-    config_dir = Path(config.get("_config_dir", "."))
-    return KnowledgeBase.load(config_dir / STORE_FILENAME, api_key)
+    return KnowledgeBase.load(store_path, api_key=api_key, backend="gemini")
 
 
 # ────────────────────── context formatting ──────────────────────

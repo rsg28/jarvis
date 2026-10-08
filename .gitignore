@@ -9,4 +9,7 @@ _hud/
 _prev/
 
 voiceprint.npy
+manga_state.json
+kb/
+_test_*.py
 

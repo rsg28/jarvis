@@ -164,7 +164,8 @@ class CommandDispatcher:
         # we don't want to burn embed calls on them.
         augmented = text
         used_kb = False
-        if self._looks_chatty(text):
+        is_chatty = self._looks_chatty(text)
+        if is_chatty:
             kb = self._get_kb()
             if kb is not None and kb.docs:
                 try:
@@ -176,18 +177,48 @@ class CommandDispatcher:
                     from knowledge import format_context
                     context = format_context(hits)
                     augmented = (
-                        "The user has uploaded reference documents. Use the "
-                        "following excerpts to answer. If the answer isn't in "
-                        "these excerpts, say so plainly — don't invent facts. "
-                        "Cite the source document name when you use it.\n\n"
+                        "You MUST respond with {\"action\":\"chat\",\"reply\":...}. "
+                        "Do NOT emit call_intent in this turn. The user is "
+                        "asking a question about their uploaded documents.\n\n"
+                        "Use ONLY the following excerpts to answer. If the "
+                        "answer isn't in them, say so plainly in the reply — "
+                        "do not invent facts. Cite the source document name "
+                        "in your reply.\n\n"
                         f"=== REFERENCE EXCERPTS ===\n{context}\n=== END ===\n\n"
                         f"User question: {text}"
                     )
                     used_kb = True
                     logging.info("[kb] grounding reply on %d chunks "
                                  "(top score %.2f)", len(hits), hits[0].score)
+            # Clear-question inputs ("?") still get a nudge toward
+            # chat mode even when no KB chunks matched, because local
+            # models can be over-eager and route "puedo sentar al
+            # paciente?" as `type sentar al paciente` based on surface
+            # word overlap. We ONLY add this nudge when there's an
+            # explicit question mark — ambiguous long inputs like
+            # "revisa si hay nuevo capitulo" should still be allowed
+            # to route to intents.
+            if not used_kb and ("?" in text or "¿" in text):
+                augmented = (
+                    "The user is asking a free-form question. Respond with "
+                    "{\"action\":\"chat\",\"reply\":...} — a short spoken "
+                    "answer. Do NOT emit call_intent unless the request is "
+                    "unambiguously an app/file/media/system command.\n\n"
+                    f"User: {text}"
+                )
 
         parsed = self._llm.infer(augmented)
+        # When we grounded via RAG, strip the LLM's own prefixed label
+        # like {"action":"chat"} and ONLY accept chat replies. If the
+        # model still tried to route an intent, downgrade to chat with
+        # whatever text it produced so the user hears SOMETHING grounded.
+        if used_kb and parsed and parsed.get("action") != "chat":
+            fallback_reply = (parsed.get("reply") or parsed.get("command")
+                              or "").strip()
+            if fallback_reply:
+                parsed = {"action": "chat", "reply": fallback_reply}
+            else:
+                parsed = None  # force the "I couldn't answer" branch
         if not parsed:
             return None
 

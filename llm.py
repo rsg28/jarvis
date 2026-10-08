@@ -331,14 +331,29 @@ class LLM:
             return None
 
 
-def build_from_config(config: dict) -> Optional["LLM"]:
+def build_from_config(config: dict):
     """Return an LLM instance if enabled in config, else None.
-    Also stores a human-readable reason in config['_llm_disabled_reason']
-    when it returns None, so the dispatcher can explain to the user."""
+    Dispatches by [llm].backend:
+      "gemini" (default)  → the LLM class in this file
+      "ollama"            → OllamaLLM from llm_ollama.py (fully local,
+                            no API key needed, zero rate limits)
+    Both backends expose the same infer()/remember()/last_error shape
+    so the dispatcher doesn't care which one it got."""
     llm_cfg = config.get("llm", {}) or {}
     if not llm_cfg.get("enabled", False):
         config["_llm_disabled_reason"] = "the language model is turned off in config"
         return None
+
+    backend = str(llm_cfg.get("backend", "gemini")).lower()
+    if backend == "ollama":
+        from llm_ollama import build_from_config as _build_ollama
+        return _build_ollama(config)
+    if backend not in ("gemini", "google"):
+        config["_llm_disabled_reason"] = \
+            f"unknown LLM backend '{backend}' in config"
+        logging.warning("unknown LLM backend: %s", backend)
+        return None
+
     api_key = llm_cfg.get("api_key") or os.environ.get("GEMINI_API_KEY", "").strip()
     if not api_key:
         logging.info("LLM enabled but no api_key / GEMINI_API_KEY set")
