@@ -12,4 +12,6 @@ voiceprint.npy
 manga_state.json
 kb/
 _test_*.py
+memory_long.json
+memory_recent.jsonl
 

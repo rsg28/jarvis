@@ -56,6 +56,9 @@ class OllamaLLM:
         self.last_error: Optional[str] = None
         self._cache: Dict[str, Tuple[float, Dict]] = {}
         self._cache_ttl: float = 600.0
+        # Persistent memory layer (long-term facts + recent exchanges).
+        # Set from the factory; None means memory is disabled.
+        self.memory = None
         # keep_alive controls how long Ollama keeps the model warm in
         # VRAM after each request. Values Ollama accepts:
         #   "5m"  -> keep loaded 5 minutes after last use
@@ -85,8 +88,27 @@ class OllamaLLM:
             del self._cache[cache_key]
 
         # Build chat history (OpenAI-style messages array).
-        messages: List[Dict] = [{"role": "system", "content": SYSTEM_PROMPT}]
+        # Memory layer: inject long-term facts into the system prompt,
+        # and seed recent turns from the persistent log so Jarvis has
+        # continuity across restarts.
+        system_text = SYSTEM_PROMPT
+        if self.memory is not None:
+            block = self.memory.context_block()
+            if block:
+                system_text = system_text + "\n\n" + block
+        messages: List[Dict] = [{"role": "system", "content": system_text}]
+        # Seed from persistent recent log first (older), then in-process
+        # history (newer) wins for duplicates. In-process history has
+        # the fresh unmemoried turns from the current session.
+        seeded = set()
+        if self.memory is not None:
+            for u, j, _ts in self.memory.tail_recent():
+                messages.append({"role": "user",      "content": u})
+                messages.append({"role": "assistant", "content": j})
+                seeded.add(u)
         for u, j in self.history:
+            if u in seeded:
+                continue
             messages.append({"role": "user",      "content": u})
             messages.append({"role": "assistant", "content": j})
         messages.append({"role": "user", "content": user_text})
@@ -178,7 +200,35 @@ class OllamaLLM:
     def remember(self, user_text: str, jarvis_reply: str) -> None:
         if not user_text or not jarvis_reply:
             return
+        low = user_text.lower()
+        is_mem_cmd = any(k in low for k in (
+            "remember", "recuerda", "memoriza",
+            "forget",   "olvida",   "olvidate",
+            "what do you remember", "que recuerdas",
+            "recent memory", "clear recent",
+        ))
+
+        # Mem-plumbing turns are NOT conversations — don't persist them
+        # or let them colour the in-process history. In particular, a
+        # "Forgotten: <fact>" reply would otherwise leak the forgotten
+        # fact back into Qwen's seeded history on the very next turn.
+        if is_mem_cmd:
+            # drop TTL cache so the next question re-queries with the
+            # fresh fact set injected into the system prompt
+            self._cache.clear()
+            if any(k in low for k in ("forget", "olvida", "olvidate")):
+                # extra: clear in-memory history too — any prior turn
+                # may mention the forgotten fact
+                self.history.clear()
+            return
+
         self.history.append((user_text.strip(), jarvis_reply.strip()))
+        # Persist non-plumbing turns so continuity survives restarts.
+        if self.memory is not None:
+            try:
+                self.memory.append_recent(user_text, jarvis_reply)
+            except Exception as exc:
+                logging.debug("[ollama] recent persist failed: %s", exc)
 
     # ─────────────────── helpers ───────────────────
     @staticmethod
@@ -305,5 +355,18 @@ def build_from_config(config: dict) -> Optional[OllamaLLM]:
     )
     inst._cache_ttl = float(llm_cfg.get("cache_seconds", 600.0))
     inst.keep_alive = str(llm_cfg.get("ollama_keep_alive", "5m"))
+    # Persistent memory (long-term facts + recent exchanges log). The
+    # directory lives next to config.toml so it's easy to inspect /
+    # hand-edit / git-ignore. See memory.py.
+    try:
+        from pathlib import Path as _P
+        from memory import Memory as _Memory
+        root = _P(config.get("_config_dir", _P(__file__).parent))
+        inst.memory = _Memory(root)
+        n = len(inst.memory.list_long())
+        logging.info("[memory] loaded %d long-term fact%s from %s",
+                     n, "s" if n != 1 else "", inst.memory.long_path)
+    except Exception as exc:
+        logging.warning("[memory] disabled (init failed): %s", exc)
     config["_llm_disabled_reason"] = None
     return inst

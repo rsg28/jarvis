@@ -264,10 +264,16 @@ class CommandDispatcher:
             # regex table so the execution path is identical to a typed
             # command. The re-entrancy guard prevents an LLM ping-pong.
             self._in_llm_dispatch = True
+            # Preserve original user text (e.g. "olvida lo del cumple")
+            # so handlers like _mem_forget can prune cross-language
+            # history even when Qwen translated the command to English.
+            prev_orig = getattr(self, "_llm_original_text", None)
+            self._llm_original_text = text
             try:
                 inner = self.dispatch(command)
             finally:
                 self._in_llm_dispatch = False
+                self._llm_original_text = prev_orig
             # If even the canonical command failed to match, treat the
             # LLM's own reply (if any) as a chat fallback.
             if inner.speak and not inner.speak.startswith("I did not catch that"):
@@ -1421,6 +1427,125 @@ class CommandDispatcher:
         return CommandResult(speak=spoken,
                              print_out=f"[ls] {target}\n{printed}")
 
+    # ────────────── persistent memory (Phase 9) ──────────────
+    # Voice-facing handlers for the Memory layer. The storage itself
+    # lives in memory.py and is wired into OllamaLLM so every inference
+    # already sees the long-term facts and the recent exchanges — these
+    # handlers are only for the user's explicit remember/forget/query
+    # commands.
+
+    def _get_memory(self):
+        """Reach into the LLM for the shared Memory instance. Returns
+        None when the LLM backend doesn't expose one (Gemini path /
+        LLM disabled)."""
+        if self._llm is None:
+            return None
+        return getattr(self._llm, "memory", None)
+
+    def _mem_remember(self, fact: str) -> CommandResult:
+        mem = self._get_memory()
+        if mem is None:
+            return CommandResult(
+                speak="Memory needs the Ollama backend to be enabled.",
+                print_out="[memory] no backend")
+        added, reason = mem.remember(fact)
+        if not added:
+            return CommandResult(
+                speak=f"I didn't add that — {reason}.",
+                print_out=f"[memory] skip: {reason}: {fact!r}")
+        return CommandResult(
+            speak=f"Got it. I'll remember that {fact}.",
+            print_out=f"[memory] +fact: {fact}")
+
+    def _mem_forget(self, query: str, *, raw: Optional[str] = None) -> CommandResult:
+        mem = self._get_memory()
+        if mem is None:
+            return CommandResult(
+                speak="Memory isn't available.",
+                print_out="[memory] no backend")
+        # Pass the raw user text too so cross-language pruning catches
+        # Spanish log lines when the fact was stored in English (etc.)
+        extras = []
+        if raw:
+            extras.append(raw)
+        orig = getattr(self, "_llm_original_text", None)
+        if orig and orig not in extras:
+            extras.append(orig)
+        removed = mem.forget(query, extra_needles=extras or None)
+        if not removed:
+            return CommandResult(
+                speak=f"I don't have any memory matching {query}.",
+                print_out=f"[memory] forget: no match for {query!r}")
+        if len(removed) == 1:
+            spoken = f"Forgotten: {removed[0]}."
+        else:
+            spoken = f"Forgot {len(removed)} memories matching {query}."
+        return CommandResult(
+            speak=spoken,
+            print_out=f"[memory] -{len(removed)}: {removed}")
+
+    def _mem_what_do_you_know(self, query: str) -> CommandResult:
+        mem = self._get_memory()
+        if mem is None:
+            return CommandResult(
+                speak="Memory isn't available.",
+                print_out="[memory] no backend")
+        hits = mem.search_long(query)
+        if not hits:
+            if query.strip():
+                return CommandResult(
+                    speak=f"I don't remember anything about {query}.",
+                    print_out=f"[memory] query empty: {query!r}")
+            return CommandResult(
+                speak="I don't have any long-term memories yet. "
+                      "Tell me 'remember that X' to start.",
+                print_out="[memory] empty long store")
+        # Spoken: short summary; printed: full list.
+        preview = "; ".join(hits[:5])
+        if len(hits) > 5:
+            preview += f"; and {len(hits) - 5} more"
+        if query.strip():
+            spoken = f"About {query}: {preview}."
+        else:
+            spoken = (f"I remember {len(hits)} thing"
+                      f"{'s' if len(hits) != 1 else ''}: {preview}.")
+        return CommandResult(
+            speak=spoken,
+            print_out="[memory] long facts:\n" + "\n".join(
+                f"  - {h}" for h in hits))
+
+    def _mem_recent(self, _m=None) -> CommandResult:
+        mem = self._get_memory()
+        if mem is None:
+            return CommandResult(
+                speak="Memory isn't available.",
+                print_out="[memory] no backend")
+        tail = mem.tail_recent(n=10)
+        if not tail:
+            return CommandResult(
+                speak="No recent exchanges on record.",
+                print_out="[memory] recent empty")
+        import time as _t, datetime as _dt
+        lines = []
+        for u, j, ts in tail:
+            when = _dt.datetime.fromtimestamp(ts).strftime("%m-%d %H:%M")
+            lines.append(f"[{when}] you: {u}\n           jarvis: {j}")
+        spoken = f"Last {len(tail)} exchanges. See the chat log for details."
+        return CommandResult(
+            speak=spoken,
+            print_out="[memory] recent:\n" + "\n".join(lines))
+
+    def _mem_clear_recent(self, _m=None) -> CommandResult:
+        mem = self._get_memory()
+        if mem is None:
+            return CommandResult(
+                speak="Memory isn't available.",
+                print_out="[memory] no backend")
+        n = mem.clear_recent()
+        return CommandResult(
+            speak=f"Cleared {n} recent exchange{'s' if n != 1 else ''}.",
+            print_out=f"[memory] cleared {n} recent lines")
+
     # ────────────── auto gaming mode (Phase 8) ──────────────
     # Background daemon that polls the process list every N seconds.
     # When a known game appears, auto-releases VRAM. When it closes,
@@ -2297,9 +2422,12 @@ INTENTS: list[tuple[str, Callable[["CommandDispatcher", re.Match], CommandResult
     # ───── Knowledge base (RAG) ─────
     # Ingest: "learn <path>", "study <path>", "aprende de <path>",
     #         "remember this file <path>", "ingest <path>"
-    (r"^(?:learn(?:\s+from)?|study|read\s+and\s+remember|remember(?:\s+this(?:\s+file)?)?|ingest"
+    # NOTE: `remember` without `this` is intentionally NOT a KB verb —
+    # that routes to the long-term memory layer (Phase 9). `remember
+    # this <path>` and `remember this file <path>` still work for KB.
+    (r"^(?:learn(?:\s+from)?|study|read\s+and\s+remember|remember\s+this(?:\s+file)?|ingest"
      r"|aprende(?:\s+de)?|aprende\s+este\s+(?:archivo|documento)"
-     r"|memoriza(?:\s+este)?)\s+(?P<q>.+?)\s*\??$",
+     r"|memoriza\s+este)\s+(?P<q>.+?)\s*\??$",
      lambda d, m: d._kb_learn(m.group("q"))),
     # List: "what documents do you know", "list my documents", "what have you learned"
     (r"^(?:what\s+documents?\s+do\s+you\s+(?:know|have|remember)"
@@ -2309,10 +2437,15 @@ INTENTS: list[tuple[str, Callable[["CommandDispatcher", re.Match], CommandResult
      r"|lista\s+(?:los\s+)?documentos?"
      r"|knowledge\s+base|kb\s+list)\s*\??$",
      lambda d, m: d._kb_list(m)),
-    # Forget: "forget <doc>", "forget everything", "olvida <doc>"
-    (r"^(?:forget|unlearn|remove|delete|olvida(?:te\s+de)?|borra)\s+"
+    # Forget a doc from the KB. Requires an explicit disambiguator
+    # (document / doc / file / archivo / documento) because plain
+    # "forget X" now routes to the long-term memory layer (Phase 9).
+    # "forget everything" / "forget all" wipes the KB.
+    (r"^(?:unlearn|forget\s+(?:the\s+)?(?:document|doc|file|archivo|documento))\s+"
      r"(?P<q>.+?)\s*\??$",
      lambda d, m: d._kb_forget(m.group("q"))),
+    (r"^(?:forget|olvida)\s+(?:all\s+(?:docs|documents)|everything\s+in\s+(?:the\s+)?kb|the\s+kb|todo\s+del\s+kb)$",
+     lambda d, m: d._kb_forget("everything")),
 
     # Diagnose a URL / page. Catches:
     #   "diagnose https://..." / "check this url" / "why is this page broken"
@@ -2396,6 +2529,22 @@ INTENTS: list[tuple[str, Callable[["CommandDispatcher", re.Match], CommandResult
     # Find a target without opening it — great for disambiguation.
     (r"^(?:find|locate|where\s+is)\s+(?P<q>.+?)\s*\??$",
      lambda d, m: d._find(m.group("q").strip())),
+
+    # ───── Memory (Phase 9) ─────
+    # Explicit canonical phrasings. LLM translates natural language
+    # into these; regex catches direct uses too.
+    (r"^remember\s+(?:that\s+)?(?P<f>.+)$",
+     lambda d, m: d._mem_remember(m.group("f").strip())),
+    (r"^(?:memory\s+)?forget\s+(?P<q>.+)$",
+     lambda d, m: d._mem_forget(m.group("q").strip(), raw=m.string)),
+    (r"^(?:what\s+do\s+you\s+(?:remember|know)(?:\s+about\s+(?P<q>.+))?"
+     r"|what\s+memories\s+do\s+you\s+have"
+     r"|(?:list|show)\s+(?:your\s+)?memor(?:y|ies))\s*\??$",
+     lambda d, m: d._mem_what_do_you_know((m.group("q") or "").strip())),
+    (r"^(?:recent\s+memory|memory\s+recent|conversation\s+history|history)$",
+     lambda d, m: d._mem_recent(m)),
+    (r"^(?:clear\s+recent(?:\s+memory)?|clear\s+history|forget\s+recent)$",
+     lambda d, m: d._mem_clear_recent(m)),
 
     # ───── Gaming mode (Phase 8) ─────
     (r"^(?:gaming\s+mode\s+on|arm\s+gaming\s+mode|modo\s+gaming\s+on|activa\s+modo\s+gaming)$",
