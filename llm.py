@@ -251,6 +251,20 @@ Few-shot examples (follow these EXACTLY):
   user: "escribe hola en la tab que estoy viendo"
   -> {"action":"call_intent","command":"type hola"}
 
+  user: "escribe en el buscador de google: hola como estas"
+  -> {"action":"call_intent","command":"type hola como estas"}
+
+  user: "pon hola mundo en la barra de busqueda"
+  -> {"action":"call_intent","command":"type hola mundo"}
+
+  user: "escribe esto en el input: foo bar baz"
+  -> {"action":"call_intent","command":"type foo bar baz"}
+
+  CRITICAL for `type`: the command text must be EXACTLY what the user
+  wants typed, with ZERO prefix like "google search" or "in the search
+  bar". The `type` intent sends raw keystrokes to the focused window;
+  the user already positioned their cursor where they want the text.
+
   user: "lee notas.txt"
   -> {"action":"call_intent","command":"read notas.txt"}
 

@@ -621,27 +621,63 @@ class CommandDispatcher:
     # ────────────── new: type text on the user's behalf ──────────────
     def _restore_user_focus(self) -> bool:
         """Return focus to the window the user had open when they
-        triggered the hotkey. The handler captures that hwnd right
-        at hotkey press time, BEFORE voice.say steals focus for the
-        TTS pipeline. Without this restore, keyboard.write typing
-        would go to the wrong window (Jarvis's indicator, or whatever
-        the shell ended up focusing on). Returns True on success."""
+        triggered the hotkey or opened the chat.
+
+        Windows is strict about SetForegroundWindow — a bare call
+        often fails silently when invoked from a different thread's
+        process. The reliable pattern is AttachThreadInput: temporarily
+        link our input queue to the target window's thread so the OS
+        treats focus changes as the user doing them, then
+        BringWindowToTop + SetForegroundWindow + SetFocus. We also
+        tap the ALT key first because Windows unlocks the foreground-
+        lock briefly after any ALT press, which is the documented
+        workaround on raymond-chen's blog."""
         if not self._last_user_hwnd:
             return False
         try:
             import ctypes
+            from ctypes import wintypes
             u32 = ctypes.windll.user32
+            k32 = ctypes.windll.kernel32
             hwnd = int(self._last_user_hwnd)
             # The window may have closed between capture and now.
             if not u32.IsWindow(hwnd):
                 return False
+            # Un-minimise if needed.
             if u32.IsIconic(hwnd):
                 u32.ShowWindow(hwnd, 9)        # SW_RESTORE
-            u32.SetForegroundWindow(hwnd)
-            # Give Windows a tick to actually promote the window.
+            # The ALT-tap trick unlocks SetForegroundWindow restrictions.
+            # Press + release of a key with no visible side-effect; we
+            # use VK_MENU (0x12 = Alt) which Windows itself uses as a
+            # focus-steal signal.
+            try:
+                import keyboard as _kb
+                _kb.press_and_release("alt")
+            except Exception:
+                pass
+            # Attach our input thread to the window's thread so the
+            # SetForegroundWindow comes "from the user's perspective".
+            current = k32.GetCurrentThreadId()
+            pid = wintypes.DWORD()
+            target = u32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+            attached = False
+            if target and current != target:
+                attached = bool(u32.AttachThreadInput(current, target, True))
+            try:
+                u32.BringWindowToTop(hwnd)
+                u32.SetForegroundWindow(hwnd)
+                u32.SetFocus(hwnd)
+            finally:
+                if attached:
+                    u32.AttachThreadInput(current, target, False)
+            # Give Windows a tick to actually promote the window AND
+            # for any element-level focus (search bar, text input) to
+            # take over keyboard input.
             import time as _t
-            _t.sleep(0.08)
-            return True
+            _t.sleep(0.15)
+            # Verify: did we actually become foreground?
+            now_fg = u32.GetForegroundWindow()
+            return now_fg == hwnd
         except Exception as exc:
             logging.debug("[focus] restore failed: %s", exc)
             return False
