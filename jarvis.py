@@ -873,6 +873,19 @@ def run_hotkey_loop(config: dict, voice: Voice) -> int:
             _ind("idle")
             logging.info("[chat] closed")
             return
+        # Capture the foreground window hwnd BEFORE we show the chat
+        # (which will steal focus). _type_text / _press_key / mouse
+        # click intents issued from chat need this to restore focus
+        # to the user's actual target (e.g. a Google search bar in
+        # Chrome) instead of typing into the Jarvis chat window itself.
+        try:
+            import ctypes as _ct
+            hwnd = _ct.windll.user32.GetForegroundWindow()
+            if hwnd:
+                dispatcher._last_user_hwnd = int(hwnd)
+                logging.debug("[chat] captured foreground hwnd=%d", hwnd)
+        except Exception as _exc:
+            logging.debug("[chat] foreground capture failed: %s", _exc)
         # Open: cancel any in-flight voice activity first.
         try:
             voice.stop()
