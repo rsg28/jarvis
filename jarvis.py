@@ -771,6 +771,20 @@ def run_hotkey_loop(config: dict, voice: Voice) -> int:
         """Runs on a worker thread. `cancel` is set by the hotkey
         message pump when a NEW press arrives — we should stop what
         we're doing and let the next activation take over."""
+        # Capture foreground window IMMEDIATELY — before anything else
+        # in this handler can steal focus (voice.say, indicator state
+        # change, listener setup). _type_text / _press_key / click
+        # intents will restore this hwnd before injecting input, so
+        # typing lands in the user's actual target instead of
+        # Jarvis's indicator or whatever the shell promoted mid-flow.
+        try:
+            import ctypes as _ct
+            hwnd = _ct.windll.user32.GetForegroundWindow()
+            if hwnd:
+                dispatcher._last_user_hwnd = int(hwnd)
+                logging.debug("[hotkey] captured foreground hwnd=%d", hwnd)
+        except Exception as _exc:
+            logging.debug("[hotkey] foreground capture failed: %s", _exc)
         # Chat mode suppresses voice input entirely — the user typed
         # their way in, so we don't want to accidentally start listening
         # to the room while they're reading a reply.

@@ -46,6 +46,13 @@ class CommandDispatcher:
         # Re-entrancy guard so an LLM-produced command that also fails to
         # match never triggers another LLM round-trip.
         self._in_llm_dispatch = False
+        # Foreground window captured at the moment the hotkey fired.
+        # The hotkey handler in jarvis.py sets this BEFORE voice.say
+        # steals focus, so _type_text / _press_key / _mouse_click can
+        # restore focus to the user's actual target (YouTube search bar,
+        # chat input, VSCode editor, etc.) right before injecting input.
+        # Set to None when no capture is available (text mode, tests).
+        self._last_user_hwnd: Optional[int] = None
         # Auto-arm gaming-mode watcher if config says so. Starts the
         # background process poll immediately so a game launched right
         # after boot still triggers an auto VRAM release. Failure here
@@ -612,6 +619,33 @@ class CommandDispatcher:
         return CommandResult(speak="Screenshot saved to your desktop.", print_out=f"[jarvis] {msg}")
 
     # ────────────── new: type text on the user's behalf ──────────────
+    def _restore_user_focus(self) -> bool:
+        """Return focus to the window the user had open when they
+        triggered the hotkey. The handler captures that hwnd right
+        at hotkey press time, BEFORE voice.say steals focus for the
+        TTS pipeline. Without this restore, keyboard.write typing
+        would go to the wrong window (Jarvis's indicator, or whatever
+        the shell ended up focusing on). Returns True on success."""
+        if not self._last_user_hwnd:
+            return False
+        try:
+            import ctypes
+            u32 = ctypes.windll.user32
+            hwnd = int(self._last_user_hwnd)
+            # The window may have closed between capture and now.
+            if not u32.IsWindow(hwnd):
+                return False
+            if u32.IsIconic(hwnd):
+                u32.ShowWindow(hwnd, 9)        # SW_RESTORE
+            u32.SetForegroundWindow(hwnd)
+            # Give Windows a tick to actually promote the window.
+            import time as _t
+            _t.sleep(0.08)
+            return True
+        except Exception as exc:
+            logging.debug("[focus] restore failed: %s", exc)
+            return False
+
     def _type_text(self, text: str) -> CommandResult:
         """Type `text` into whatever window currently has focus.
         Supports snippet substitution: `type my email` uses
@@ -635,6 +669,11 @@ class CommandDispatcher:
         try:
             import keyboard
             import time as _time
+            # Restore focus to the user's target window BEFORE typing,
+            # otherwise the keystrokes land in Jarvis's indicator or
+            # whichever window the shell happened to focus after the
+            # hotkey press.
+            restored = self._restore_user_focus()
             # Small delay so the Ctrl+Shift+Space modifiers we're
             # holding at the moment of activation are released before
             # we start injecting keystrokes.
@@ -646,7 +685,9 @@ class CommandDispatcher:
                 print_out=f"[type] failed: {exc}",
             )
         preview = text if len(text) <= 60 else text[:57] + "..."
-        return CommandResult(print_out=f"[type] wrote {len(text)} chars: {preview}")
+        tag = "restored-focus" if restored else "no-focus-capture"
+        return CommandResult(
+            print_out=f"[type] wrote {len(text)} chars ({tag}): {preview}")
 
     def _press_key(self, combo: str) -> CommandResult:
         """Press a single key or combo like 'enter', 'tab', 'ctrl+a'."""
@@ -661,6 +702,10 @@ class CommandDispatcher:
         try:
             import keyboard
             import time as _time
+            # Same focus-restore trick as _type_text — otherwise
+            # `press enter` after a hotkey trigger lands in Jarvis's
+            # own indicator window instead of the user's target.
+            self._restore_user_focus()
             _time.sleep(0.25)
             keyboard.press_and_release(combo)
         except Exception as exc:
