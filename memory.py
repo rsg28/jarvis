@@ -39,8 +39,8 @@ from typing import Dict, List, Optional, Tuple
 
 
 MAX_LONG_FACTS      = 100
-MAX_RECENT_LINES    = 500
-RECENT_IN_CONTEXT   = 10
+MAX_RECENT_LINES    = 1000
+RECENT_IN_CONTEXT   = 20
 
 
 @dataclass

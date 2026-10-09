@@ -175,6 +175,19 @@ class OllamaLLM:
 
         parsed = self._extract_json(content)
         if parsed and "action" in parsed:
+            # Auto-memory: if the LLM noticed a durable personal fact
+            # worth saving (name, pet, job, preference, etc.), it may
+            # include a `fact_to_remember` field alongside its action.
+            # We save it silently so the user isn't interrupted mid-flow.
+            auto_fact = (parsed.get("fact_to_remember") or "").strip()
+            if auto_fact and self.memory is not None:
+                try:
+                    added = self.memory.remember(auto_fact)
+                    if added:
+                        logging.info("[memory] auto-remembered: %s",
+                                     auto_fact[:120])
+                except Exception as exc:
+                    logging.debug("[memory] auto-remember failed: %s", exc)
             if self._cache_ttl > 0:
                 self._cache[cache_key] = (now, parsed)
             return parsed
