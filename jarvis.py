@@ -767,6 +767,61 @@ def run_hotkey_loop(config: dict, voice: Voice) -> int:
         except Exception:
             pass
 
+    # ─── keyboard-activity watcher ───
+    # If the user is actively typing (anywhere, in any window), the
+    # hotkey press was almost certainly accidental (bumped the combo
+    # mid-sentence, autocomplete-triggered chord, etc.). Likewise if
+    # typing starts WHILE Jarvis is listening — the user shifted
+    # attention to something else and isn't talking to Jarvis.
+    #
+    # Install a global keyboard hook that stamps `last_ts` on every
+    # NON-hotkey keystroke. The hotkey handler then:
+    #   (a) pre-check: if last_ts is within cancel window, skip
+    #       listening entirely with a quiet indicator reset.
+    #   (b) post-check: if last_ts advanced DURING the listen window,
+    #       drop the transcript before dispatching.
+    voice_cfg = config.get("voice", {}) or {}
+    cancel_on_kb = bool(voice_cfg.get("cancel_on_keyboard", True))
+    kb_window_s = float(voice_cfg.get("keyboard_cancel_window_ms", 1500)) / 1000.0
+    kb_activity = {"last_ts": 0.0, "last_key": ""}
+    # Parse the hotkey combo so its component keys don't count as
+    # "user typing". e.g. "ctrl+shift+space" -> {"ctrl","shift","space"}.
+    hotkey_component_keys = {p.strip().lower()
+                             for p in combo.split("+") if p.strip()}
+    # Also exclude pure modifiers and media/system keys that aren't
+    # text input and shouldn't abort voice.
+    _ignore_keys = {
+        "ctrl", "shift", "alt", "windows", "cmd", "meta",
+        "left ctrl", "right ctrl", "left shift", "right shift",
+        "left alt", "right alt", "left windows", "right windows",
+        "caps lock", "num lock", "scroll lock", "fn",
+        "volume up", "volume down", "volume mute",
+        "play/pause media", "next track", "previous track",
+        "print screen", "pause",
+    }
+    _ignore_keys |= hotkey_component_keys
+
+    if cancel_on_kb:
+        def _kb_hook(event) -> None:
+            try:
+                if getattr(event, "event_type", "down") != "down":
+                    return
+                name = (getattr(event, "name", "") or "").lower()
+                if not name or name in _ignore_keys:
+                    return
+                kb_activity["last_ts"] = time.monotonic()
+                kb_activity["last_key"] = name
+            except Exception:
+                pass
+        try:
+            import keyboard as _kb_mod
+            _kb_mod.hook(_kb_hook)
+            logging.info("[voice] keyboard-activity cancel enabled "
+                         "(window=%.2fs, ignore=%d keys)",
+                         kb_window_s, len(_ignore_keys))
+        except Exception as exc:
+            logging.warning("[voice] could not install kb-activity hook: %s", exc)
+
     def _on_hotkey(cancel: "threading.Event") -> None:
         """Runs on a worker thread. `cancel` is set by the hotkey
         message pump when a NEW press arrives — we should stop what
@@ -792,8 +847,23 @@ def run_hotkey_loop(config: dict, voice: Voice) -> int:
             _safe_print("[hotkey] chat is open — voice input disabled")
             logging.info("[hotkey] ignored: chat window is open")
             return
+        # Keyboard-activity gate (pre-check). If the user typed in the
+        # last `kb_window_s` seconds (anywhere), skip listening — the
+        # hotkey was probably accidental or they aren't addressing us.
+        if cancel_on_kb:
+            idle = time.monotonic() - kb_activity["last_ts"]
+            if kb_activity["last_ts"] > 0 and idle < kb_window_s:
+                _safe_print(f"[hotkey] cancelled — you were just typing "
+                            f"({idle*1000:.0f}ms ago, key={kb_activity['last_key']!r})")
+                logging.info("[hotkey] pre-check cancel: typing %.0fms ago (key=%r)",
+                             idle * 1000, kb_activity["last_key"])
+                _ind("idle")
+                return
         _safe_print(f"[hotkey] {combo} pressed — listening…")
         _ind("listening")
+        # Mark the start of this listen window so the post-check knows
+        # which keystrokes count as "typed during listening".
+        listen_t0 = time.monotonic()
         listener = _ensure_listener()
         if listener is None:
             _ind("error")
@@ -837,6 +907,18 @@ def run_hotkey_loop(config: dict, voice: Voice) -> int:
             return
         if not text:
             _safe_print("[hotkey] no command captured (empty or rejected)")
+            _ind("idle")
+            return
+        # Keyboard-activity gate (post-check). If the user typed WHILE
+        # we were listening, they shifted attention away from Jarvis —
+        # don't dispatch the (possibly stale) transcript.
+        if cancel_on_kb and kb_activity["last_ts"] > listen_t0:
+            dt = (kb_activity["last_ts"] - listen_t0) * 1000.0
+            _safe_print(f"[hotkey] cancelled — you typed during listening "
+                        f"(+{dt:.0f}ms, key={kb_activity['last_key']!r}): "
+                        f"dropped transcript {text[:60]!r}")
+            logging.info("[hotkey] post-check cancel: typed +%.0fms into listen, "
+                         "key=%r, dropped=%r", dt, kb_activity["last_key"], text[:120])
             _ind("idle")
             return
         try:

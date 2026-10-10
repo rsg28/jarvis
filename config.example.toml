@@ -7,7 +7,9 @@ address         = "sir"           # how Jarvis addresses you. Try "sir",
 greeting_style  = "morning"       # placeholder for future personalization
 
 [voice]
-enabled    = true
+enabled                       = true
+cancel_on_keyboard            = true
+keyboard_cancel_window_ms     = 1500
 engine     = "auto"               # "auto" (edge → sapi) | "edge" | "sapi"
 voice_name = "en-US-JennyNeural"  # neural voice for edge-tts. Some options:
                                   #   en-US-JennyNeural     warm female (default)
@@ -38,6 +40,15 @@ ack     = "Yes?"                  # what Jarvis says when it hears you
 enabled = true
 combo   = "ctrl+alt+j"          # any `keyboard` combo string works
 ack     = true                  # brief "Yes?" cue when activated
+
+# Cancel-on-keyboard: if you were typing when the hotkey fired, or if
+# you start typing WHILE Jarvis is listening, the voice session is
+# dropped. The hotkey's own component keys (ctrl/alt/j in the default
+# combo) don't count. Also ignores modifiers and media keys.
+# Set `cancel_on_keyboard = false` to disable; tune the window to
+# taste (ms). Default 1500ms is "last keystroke within ~1.5 seconds".
+# These live under [voice] (not [hotkey]) so they also apply to any
+# future voice entry points.
 
 [speaker]
 # Speaker verification — Jarvis only responds to your enrolled voiceprint.
