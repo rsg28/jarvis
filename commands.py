@@ -431,6 +431,135 @@ class CommandDispatcher:
         webbrowser.open(url)
         return CommandResult(speak=f"Searching for {query}.", print_out=f"[jarvis] opened {url}")
 
+    def _connect_spotify(self, _match=None) -> CommandResult:
+        """One-time 'ask permission' flow — the simpler alternative
+        to setting up Spotify Developer API credentials. Finds the
+        installed Spotify desktop app, launches it, verifies it starts,
+        and writes [spotify].app_connected = true so future `play X`
+        commands open the app instead of nagging about client_id."""
+        try:
+            import spotify as sp_mod
+        except Exception as exc:
+            return CommandResult(
+                speak="Spotify module isn't available right now.",
+                print_out=f"[spotify] import failed: {exc}")
+
+        exe = sp_mod.find_spotify_exe()
+        if not exe and not sp_mod.is_spotify_running():
+            return CommandResult(
+                speak=("Spotify doesn't look installed on this machine. "
+                       "Install it from spotify dot com, then say "
+                       "'connect to spotify' again."),
+                print_out="[spotify] not installed")
+
+        was_running = sp_mod.is_spotify_running()
+        if not was_running:
+            if not sp_mod.launch_spotify(exe):
+                return CommandResult(
+                    speak="I couldn't launch the Spotify app.",
+                    print_out=f"[spotify] launch failed (exe={exe})")
+            # give it a moment to start
+            import time as _t
+            for _ in range(10):
+                _t.sleep(0.4)
+                if sp_mod.is_spotify_running():
+                    break
+
+        if not sp_mod.is_spotify_running():
+            return CommandResult(
+                speak=("I tried launching Spotify but it didn't come up. "
+                       "Try opening it manually, then say connect again."),
+                print_out=f"[spotify] launch verify failed (exe={exe})")
+
+        # Persist the approval so future play commands know we're good.
+        self._config_set(["spotify", "app_connected"], True)
+        if exe:
+            self._config_set(["spotify", "exe_path"], exe)
+
+        verb = "Already running" if was_running else "Launched"
+        return CommandResult(
+            speak=("Connected to the Spotify app. From now on, "
+                   "when you say play something, I'll search for it "
+                   "inside Spotify directly — no browser."),
+            print_out=f"[spotify] {verb}. exe={exe}. app_connected=True")
+
+    def _spotify_app_ready(self) -> bool:
+        """True if the user has approved the app-only connection."""
+        sp_cfg = self.config.get("spotify") or {}
+        if sp_cfg.get("app_connected"):
+            return True
+        # Auto-detect: if the app is already running (user opened it
+        # themselves), count that as implicit approval for this session.
+        try:
+            import spotify as sp_mod
+            if sp_mod.is_spotify_running():
+                return True
+        except Exception:
+            pass
+        return False
+
+    def _config_set(self, path: list, value) -> None:
+        """Persist a config change to the user's config.toml. Walks
+        `path` ['section', 'key', ...] into self.config, then writes
+        the whole thing out via a tiny TOML serialiser (no external
+        tomli-w dependency)."""
+        node = self.config
+        for key in path[:-1]:
+            if key not in node or not isinstance(node[key], dict):
+                node[key] = {}
+            node = node[key]
+        node[path[-1]] = value
+        cfg_dir = self.config.get("_config_dir")
+        if not cfg_dir:
+            logging.info("[config] no _config_dir; in-memory only")
+            return
+        from pathlib import Path as _P
+        cfg_file = _P(cfg_dir) / "config.toml"
+        try:
+            self._dump_config(self.config, cfg_file)
+            logging.info("[config] persisted %s=%r to %s",
+                         ".".join(path), value, cfg_file)
+        except Exception as exc:
+            logging.warning("[config] write failed: %s", exc)
+
+    @staticmethod
+    def _dump_config(cfg: dict, path) -> None:
+        """Minimal TOML writer — handles the tables/scalars/lists this
+        app actually uses. Not a full TOML spec, but round-trips what
+        we need."""
+        def _fmt(v):
+            if isinstance(v, bool):   return "true" if v else "false"
+            if isinstance(v, (int, float)): return str(v)
+            if isinstance(v, list):
+                inner = ", ".join(_fmt(x) for x in v)
+                return f"[{inner}]"
+            if isinstance(v, str):
+                esc = v.replace("\\", "\\\\").replace('"', '\\"')
+                return f'"{esc}"'
+            return _fmt(str(v))
+
+        lines = []
+        # Scalars at the root first
+        root_keys = [k for k, v in cfg.items()
+                     if not isinstance(v, dict) and not k.startswith("_")]
+        for k in root_keys:
+            lines.append(f"{k} = {_fmt(cfg[k])}")
+        if root_keys:
+            lines.append("")
+        # Then tables
+        for name, section in cfg.items():
+            if name.startswith("_") or not isinstance(section, dict):
+                continue
+            lines.append(f"[{name}]")
+            for k, v in section.items():
+                if isinstance(v, dict):
+                    continue  # nested tables not used by this app
+                lines.append(f"{k} = {_fmt(v)}")
+            lines.append("")
+        from pathlib import Path as _P
+        _P(path).write_text("\n".join(lines).rstrip() + "\n",
+                            encoding="utf-8")
+
     def _play_spotify(self, query: str) -> CommandResult:
         """Play a song in the Spotify DESKTOP app.
 
@@ -488,15 +617,54 @@ class CommandDispatcher:
                     )
                 reason = "launch_failed"
 
-        # ── Fallback: open the web search page with a spoken reason ──
+        # ── Fallback #1: app-only path (no API credentials needed) ──
+        # Uses `spotify:search:X` URI which opens the desktop app at
+        # its internal search for that query. Requires the user to
+        # have run "connect to spotify" at least once (or to already
+        # have Spotify running).
+        if reason == "no_credentials" and self._spotify_app_ready():
+            try:
+                import spotify as sp_mod
+                if sp_mod._launch_uri(f"spotify:search:{query}"):
+                    # Press Enter after a short wait to confirm the
+                    # search in Spotify 1.2+ (highlights top result;
+                    # user still clicks to play, but no browser).
+                    def _nudge():
+                        import time as _t
+                        _t.sleep(1.4)
+                        try:
+                            import ctypes
+                            VK_RETURN = 0x0D
+                            KEYEVENTF_KEYUP = 0x0002
+                            ctypes.windll.user32.keybd_event(VK_RETURN, 0, 0, 0)
+                            ctypes.windll.user32.keybd_event(
+                                VK_RETURN, 0, KEYEVENTF_KEYUP, 0)
+                        except Exception:
+                            pass
+                    import threading as _th
+                    _th.Thread(target=_nudge, daemon=True,
+                               name="SpotifySearchNudge").start()
+                    return CommandResult(
+                        speak=f"Opened Spotify search for {query}.",
+                        print_out=f"[spotify] app-only search → spotify:search:{query}")
+            except Exception as exc:
+                logging.warning("[spotify] app-only path failed: %s", exc)
+
+        # ── Fallback #2: nudge to connect / open web search ──
+        if reason == "no_credentials" and not self._spotify_app_ready():
+            return CommandResult(
+                speak=("I'm not connected to Spotify yet. "
+                       "Say 'connect to spotify' once to approve the "
+                       "connection, then I'll play things in the app "
+                       "directly — no browser, no API keys."),
+                print_out="[spotify] not yet connected; say 'connect to spotify'")
+
+        # ── Fallback #3: web search page (true last resort) ──
         url = f"https://open.spotify.com/search/{urllib.parse.quote_plus(query)}"
         webbrowser.open(url)
         if reason == "no_credentials":
-            speak = (f"I don't have Spotify credentials yet, so I can't play "
-                     f"inside the app. I opened the search for {query} in your "
-                     f"browser. Add your Spotify client id and secret to the "
-                     f"config to play directly from the app next time.")
-            print_tag = "[spotify] credentials missing"
+            speak = (f"I opened the search for {query} in your browser.")
+            print_tag = "[spotify] browser fallback"
         elif reason == "no_match":
             speak = (f"I couldn't find a track called {query} on Spotify. "
                      f"I opened the search in your browser so you can pick one.")
@@ -625,67 +793,145 @@ class CommandDispatcher:
         return CommandResult(speak="Screenshot saved to your desktop.", print_out=f"[jarvis] {msg}")
 
     # ────────────── new: type text on the user's behalf ──────────────
+    @staticmethod
+    def _win_hwnd_info(hwnd: int) -> str:
+        """Return 'Title (pid=N, class=X)' for diagnostics."""
+        try:
+            import ctypes
+            from ctypes import wintypes
+            u32 = ctypes.windll.user32
+            buf = ctypes.create_unicode_buffer(256)
+            u32.GetWindowTextW(hwnd, buf, 256)
+            cls = ctypes.create_unicode_buffer(128)
+            u32.GetClassNameW(hwnd, cls, 128)
+            pid = wintypes.DWORD()
+            u32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+            return f"{buf.value!r} (hwnd={hwnd}, pid={pid.value}, class={cls.value!r})"
+        except Exception:
+            return f"(hwnd={hwnd}, info unavailable)"
+
+    @staticmethod
+    def _sendinput_alt_tap() -> None:
+        """Press + release ALT via raw SendInput, bypassing the
+        `keyboard` module's hook (which can swallow the event when
+        our own listener owns the hook). This unlocks the Windows
+        foreground-change restriction for the next SetForegroundWindow
+        call (documented behaviour: ALT is treated as the user
+        asserting input focus, so the OS stops guarding against
+        focus-steal for ~1 call)."""
+        try:
+            import ctypes
+            from ctypes import wintypes
+            VK_MENU = 0x12
+            KEYEVENTF_KEYUP = 0x0002
+            INPUT_KEYBOARD = 1
+            class KEYBDINPUT(ctypes.Structure):
+                _fields_ = [("wVk", wintypes.WORD),
+                            ("wScan", wintypes.WORD),
+                            ("dwFlags", wintypes.DWORD),
+                            ("time", wintypes.DWORD),
+                            ("dwExtraInfo", ctypes.c_void_p)]
+            class _INPUT_UNION(ctypes.Union):
+                _fields_ = [("ki", KEYBDINPUT),
+                            ("padding", ctypes.c_ubyte * 32)]
+            class INPUT(ctypes.Structure):
+                _anonymous_ = ("u",)
+                _fields_ = [("type", wintypes.DWORD), ("u", _INPUT_UNION)]
+            inp_down = INPUT(type=INPUT_KEYBOARD)
+            inp_down.ki = KEYBDINPUT(wVk=VK_MENU, wScan=0, dwFlags=0,
+                                     time=0, dwExtraInfo=None)
+            inp_up = INPUT(type=INPUT_KEYBOARD)
+            inp_up.ki = KEYBDINPUT(wVk=VK_MENU, wScan=0,
+                                   dwFlags=KEYEVENTF_KEYUP, time=0,
+                                   dwExtraInfo=None)
+            arr = (INPUT * 2)(inp_down, inp_up)
+            ctypes.windll.user32.SendInput(2, arr, ctypes.sizeof(INPUT))
+        except Exception as exc:
+            logging.debug("[focus] alt-tap failed: %s", exc)
+
     def _restore_user_focus(self) -> bool:
         """Return focus to the window the user had open when they
         triggered the hotkey or opened the chat.
 
-        Windows is strict about SetForegroundWindow — a bare call
-        often fails silently when invoked from a different thread's
-        process. The reliable pattern is AttachThreadInput: temporarily
-        link our input queue to the target window's thread so the OS
-        treats focus changes as the user doing them, then
-        BringWindowToTop + SetForegroundWindow + SetFocus. We also
-        tap the ALT key first because Windows unlocks the foreground-
-        lock briefly after any ALT press, which is the documented
-        workaround on raymond-chen's blog."""
+        Hardened pattern (every step matters):
+          1. Resolve to top-level root HWND (Chrome/Edge/Electron have
+             many sub-hwnds; SetForegroundWindow needs the root).
+          2. If minimised -> SW_RESTORE.
+          3. ALT tap via SendInput (NOT the `keyboard` module whose
+             hook can swallow it).
+          4. AttachThreadInput so our focus request looks user-initiated.
+          5. BringWindowToTop + SetForegroundWindow + SetFocus.
+          6. Verify by comparing GetForegroundWindow() to our target.
+          7. If verification fails, retry once with longer settle."""
         if not self._last_user_hwnd:
+            logging.info("[focus] no hwnd captured — nothing to restore")
             return False
         try:
             import ctypes
             from ctypes import wintypes
             u32 = ctypes.windll.user32
             k32 = ctypes.windll.kernel32
-            hwnd = int(self._last_user_hwnd)
-            # The window may have closed between capture and now.
-            if not u32.IsWindow(hwnd):
+            import time as _t
+
+            raw_hwnd = int(self._last_user_hwnd)
+            if not u32.IsWindow(raw_hwnd):
+                logging.info("[focus] captured hwnd %d is gone", raw_hwnd)
                 return False
-            # Un-minimise if needed.
+
+            # Step 1: get the ROOT (top-level) hwnd. GetAncestor with
+            # GA_ROOT=2 walks up to the top-level window — essential
+            # for Chrome/Edge where the captured hwnd is often a
+            # child frame.
+            root = u32.GetAncestor(raw_hwnd, 2) or raw_hwnd
+            if root != raw_hwnd:
+                logging.info("[focus] walked %d -> root %d (%s)",
+                             raw_hwnd, root, self._win_hwnd_info(root))
+            hwnd = root
+
+            # Step 2: un-minimise.
             if u32.IsIconic(hwnd):
                 u32.ShowWindow(hwnd, 9)        # SW_RESTORE
-            # The ALT-tap trick unlocks SetForegroundWindow restrictions.
-            # Press + release of a key with no visible side-effect; we
-            # use VK_MENU (0x12 = Alt) which Windows itself uses as a
-            # focus-steal signal.
-            try:
-                import keyboard as _kb
-                _kb.press_and_release("alt")
-            except Exception:
-                pass
-            # Attach our input thread to the window's thread so the
-            # SetForegroundWindow comes "from the user's perspective".
-            current = k32.GetCurrentThreadId()
-            pid = wintypes.DWORD()
-            target = u32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
-            attached = False
-            if target and current != target:
-                attached = bool(u32.AttachThreadInput(current, target, True))
-            try:
-                u32.BringWindowToTop(hwnd)
-                u32.SetForegroundWindow(hwnd)
-                u32.SetFocus(hwnd)
-            finally:
-                if attached:
-                    u32.AttachThreadInput(current, target, False)
-            # Give Windows a tick to actually promote the window AND
-            # for any element-level focus (search bar, text input) to
-            # take over keyboard input.
-            import time as _t
-            _t.sleep(0.15)
-            # Verify: did we actually become foreground?
-            now_fg = u32.GetForegroundWindow()
-            return now_fg == hwnd
+                _t.sleep(0.05)
+
+            # Attempt up to 2 times — Windows sometimes needs a second
+            # try when the foreground-lock is strict.
+            for attempt in (1, 2):
+                # Step 3: ALT tap via raw SendInput (bypass keyboard hook).
+                self._sendinput_alt_tap()
+                _t.sleep(0.02)
+
+                # Step 4: AttachThreadInput.
+                current = k32.GetCurrentThreadId()
+                pid = wintypes.DWORD()
+                target = u32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+                attached = False
+                if target and current != target:
+                    attached = bool(u32.AttachThreadInput(current, target, True))
+                try:
+                    # Step 5: raise + focus.
+                    u32.BringWindowToTop(hwnd)
+                    u32.SetForegroundWindow(hwnd)
+                    u32.SetFocus(hwnd)
+                finally:
+                    if attached:
+                        u32.AttachThreadInput(current, target, False)
+
+                # Settle. 0.2s is enough on fast machines; the retry
+                # bumps to 0.4s.
+                _t.sleep(0.2 if attempt == 1 else 0.4)
+
+                # Step 6: verify.
+                now_fg = u32.GetForegroundWindow()
+                if now_fg == hwnd:
+                    logging.info("[focus] restored on attempt %d -> %s",
+                                 attempt, self._win_hwnd_info(hwnd))
+                    return True
+                logging.info("[focus] attempt %d failed: fg=%s target=%s",
+                             attempt, self._win_hwnd_info(now_fg),
+                             self._win_hwnd_info(hwnd))
+            return False
         except Exception as exc:
-            logging.debug("[focus] restore failed: %s", exc)
+            logging.warning("[focus] restore raised: %s", exc)
             return False
 
     def _type_text(self, text: str) -> CommandResult:
@@ -709,19 +955,47 @@ class CommandDispatcher:
                 break
 
         try:
-            import keyboard
             import time as _time
-            # Restore focus to the user's target window BEFORE typing,
-            # otherwise the keystrokes land in Jarvis's indicator or
-            # whichever window the shell happened to focus after the
-            # hotkey press.
-            restored = self._restore_user_focus()
-            # Small delay so the Ctrl+Shift+Space modifiers we're
-            # holding at the moment of activation are released before
-            # we start injecting keystrokes.
+            # 1) Wait FIRST — the user might still be holding the
+            #    Ctrl+Shift+Space hotkey when the LLM returns. Typing
+            #    while modifiers are held mangles output (e.g. Ctrl+h
+            #    deletes instead of writing 'h'). Also lets the voice
+            #    pipeline settle.
             _time.sleep(0.35)
-            keyboard.write(text, delay=0.01)
+            # 2) Restore focus to the user's target window.
+            restored = self._restore_user_focus()
+            # 3) Second verify immediately before injecting — a race
+            #    between restore and type can let a Tool window
+            #    sneak back. If we lost focus in the micro-gap, try
+            #    once more.
+            if restored:
+                import ctypes
+                u32 = ctypes.windll.user32
+                root = u32.GetAncestor(int(self._last_user_hwnd), 2) \
+                       or int(self._last_user_hwnd)
+                if u32.GetForegroundWindow() != root:
+                    logging.info("[type] focus slipped post-restore, "
+                                 "re-asserting")
+                    restored = self._restore_user_focus()
+            # 4) Type via pyautogui — uses SendInput directly, bypasses
+            #    the `keyboard` module's global hook (which our own
+            #    listener owns, and can intercept its own writes).
+            import pyautogui
+            # Disable pyautogui's slow fail-safe check; we're not
+            # mouse-automating here.
+            pyautogui.PAUSE = 0
+            pyautogui.FAILSAFE = False
+            # Prefer `write` (ASCII) + `typewrite` fallback; for
+            # non-ASCII (accents, ñ, emoji) fall back to `keyboard.write`
+            # which handles unicode via clipboard-like injection.
+            is_ascii = all(ord(c) < 128 for c in text)
+            if is_ascii:
+                pyautogui.typewrite(text, interval=0.012)
+            else:
+                import keyboard as _kb
+                _kb.write(text, delay=0.012)
         except Exception as exc:
+            logging.exception("[type] failed")
             return CommandResult(
                 speak=f"I can't type right now: {type(exc).__name__}.",
                 print_out=f"[type] failed: {exc}",
@@ -1853,6 +2127,58 @@ class CommandDispatcher:
         pag.FAILSAFE = False
         return pag
 
+    def _test_typing(self, _match=None) -> CommandResult:
+        """Diagnostic: capture current foreground, say 'typing in 5
+        seconds — click your target window now', countdown via voice,
+        then run the full restore+type path on a known string. Logs
+        every step so a failure can be post-mortemed."""
+        import ctypes, time as _t
+        u32 = ctypes.windll.user32
+
+        before = u32.GetForegroundWindow()
+        before_info = self._win_hwnd_info(before)
+        logging.info("[test-type] start fg=%s", before_info)
+
+        try:
+            self.voice.say("I will type a test string in 5 seconds. "
+                           "Click into the window you want me to type into "
+                           "right now.")
+        except Exception:
+            pass
+        for n in (3, 2, 1):
+            _t.sleep(1.0)
+            try:
+                self.voice.say(str(n))
+            except Exception:
+                pass
+        _t.sleep(1.0)
+
+        target = u32.GetForegroundWindow()
+        target_info = self._win_hwnd_info(target)
+        logging.info("[test-type] target captured fg=%s", target_info)
+
+        # Overwrite the stored hwnd with what the user chose during
+        # countdown, then run the exact production path.
+        self._last_user_hwnd = int(target)
+
+        test_text = "jarvis test 12345"
+        result = self._type_text(test_text)
+        after = u32.GetForegroundWindow()
+        after_info = self._win_hwnd_info(after)
+        logging.info("[test-type] done fg=%s (hoped=%s) result=%r",
+                     after_info, target_info, result.print_out)
+
+        report = (
+            f"before={before_info}\n"
+            f"target={target_info}\n"
+            f"after ={after_info}\n"
+            f"typed ={test_text!r}\n"
+            f"result={result.print_out}"
+        )
+        _safe = ("Done. Check if 'jarvis test 12345' appeared in your "
+                 "window. If it did not, say 'show typing log'.")
+        return CommandResult(speak=_safe, print_out=report)
+
     def _mouse_pos(self, _match=None) -> CommandResult:
         try:
             pag = self._mouse()
@@ -2579,6 +2905,12 @@ INTENTS: list[tuple[str, Callable[["CommandDispatcher", re.Match], CommandResult
     # button") will come in a later phase once we pick a vision model.
     (r"^mouse\s+position$",
      lambda d, m: d._mouse_pos()),
+
+    # Self-test: diagnose typing-focus. Says "typing in 5 seconds",
+    # user clicks target, Jarvis types `jarvis test 12345` and logs
+    # every hwnd transition for post-mortem.
+    (r"^(?:test\s+typing|typing\s+test|diagnose\s+typing|prueba\s+(?:de\s+)?escribir)$",
+     lambda d, m: d._test_typing()),
     (r"^(?:move\s+(?:mouse\s+)?(?:to\s+)?|move\s+cursor\s+to\s+)"
      r"(?P<x>-?\d+)[\s,]+(?P<y>-?\d+)$",
      lambda d, m: d._mouse_move(m.group("x"), m.group("y"))),
@@ -2622,6 +2954,11 @@ INTENTS: list[tuple[str, Callable[["CommandDispatcher", re.Match], CommandResult
      lambda d, m: d._search_web(m.group("q").strip())),
     (r"^look\s+up\s+(?P<q>.+)$",
      lambda d, m: d._search_web(m.group("q").strip())),
+
+    # Spotify: one-time connection permission (no API keys needed).
+    # English + Spanish phrasings.
+    (r"^(?:connect(?:\s+to)?\s+spotify|setup\s+spotify|conect(?:a|ar)(?:\s+a)?\s+spotify|configura(?:r)?\s+spotify)$",
+     lambda d, m: d._connect_spotify()),
 
     # Spotify search — `play <song>` and `spotify <song>`
     (r"^(?:play|spotify)\s+(?P<q>.+)$",

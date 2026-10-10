@@ -116,6 +116,76 @@ class SpotifyAPI:
 
 
 # ─────────────────── Desktop control ───────────────────
+def find_spotify_exe() -> Optional[str]:
+    """Locate the Spotify desktop app without needing API credentials.
+    Returns the full path if found, else None.
+
+    Checks (in order):
+      1. %APPDATA%\\Spotify\\Spotify.exe       — classic installer
+      2. %LOCALAPPDATA%\\Microsoft\\WindowsApps\\Spotify.exe — MS Store
+      3. PATH lookup via shutil.which
+      4. Program Files variants
+    """
+    if platform.system() != "Windows":
+        # macOS/Linux: just check the typical locations.
+        if sys.platform == "darwin":
+            p = "/Applications/Spotify.app"
+            return p if os.path.isdir(p) else None
+        import shutil as _sh
+        return _sh.which("spotify")
+
+    import shutil as _sh
+    candidates = [
+        os.path.join(os.environ.get("APPDATA", ""), "Spotify", "Spotify.exe"),
+        os.path.join(os.environ.get("LOCALAPPDATA", ""),
+                     "Microsoft", "WindowsApps", "Spotify.exe"),
+        os.path.join(os.environ.get("ProgramFiles", ""), "Spotify", "Spotify.exe"),
+        os.path.join(os.environ.get("ProgramFiles(x86)", ""), "Spotify", "Spotify.exe"),
+    ]
+    for p in candidates:
+        if p and os.path.isfile(p):
+            return p
+    which = _sh.which("Spotify.exe") or _sh.which("spotify")
+    return which
+
+
+def is_spotify_running() -> bool:
+    """Return True if a Spotify process is currently alive."""
+    try:
+        import psutil
+    except Exception:
+        return False
+    for p in psutil.process_iter(attrs=["name"]):
+        n = (p.info.get("name") or "").lower()
+        if n in ("spotify.exe", "spotify"):
+            return True
+    return False
+
+
+def launch_spotify(exe_path: Optional[str] = None) -> bool:
+    """Start the Spotify desktop app. Returns True on launch attempt."""
+    try:
+        if platform.system() == "Windows":
+            # Prefer the URI handler — works even if we didn't find the
+            # exe path (Microsoft Store install registers the handler).
+            os.startfile("spotify:")  # type: ignore[attr-defined]
+            return True
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", "-a", "Spotify"])
+            return True
+        else:
+            subprocess.Popen(["spotify"])
+            return True
+    except Exception:
+        if exe_path and os.path.isfile(exe_path):
+            try:
+                subprocess.Popen([exe_path])
+                return True
+            except Exception as exc:
+                logging.warning("[spotify] exec %s failed: %s", exe_path, exc)
+        return False
+
+
 def _launch_uri(uri: str) -> bool:
     """Open a `spotify:` URI with the system handler so the Spotify
     desktop app comes to the foreground on the right page."""

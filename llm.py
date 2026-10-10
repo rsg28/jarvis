@@ -140,6 +140,13 @@ Prefer these EXACT phrasings when you emit `call_intent`:
                                       -> "run pip install flask"
   find <name>                    List matching apps / files without opening.
   search <query>                 Google search
+  connect to spotify             one-time permission flow — Jarvis finds the
+                                 installed Spotify desktop app, launches it,
+                                 verifies it starts, and remembers the
+                                 approval so future `play X` opens the app
+                                 directly (no browser, no API keys). Use
+                                 when the user says "connect to spotify",
+                                 "setup spotify", "conectar spotify".
   play <song>                    play a specific song on Spotify (desktop app).
                                  Also matches "pon <song>", "reproduce <song>",
                                  "pon <song> en la app", "play <song> on Spotify".
@@ -158,6 +165,11 @@ Prefer these EXACT phrasings when you emit `call_intent`:
                                  Snippet form: "type my email" uses config.
   type my email | type my name | type my phone | type my address | type my github
   press <key>                    e.g. "press enter", "press tab", "press ctrl+a"
+  test typing | typing test      diagnostic — counts down 5s, lets the user
+                                 pick a target window, then types a canary
+                                 string and logs focus transitions. Use
+                                 when the user says "test typing", "prueba
+                                 de escribir", "diagnose typing", etc.
   screenshot                     save a PNG of the screen to Desktop
   read my screen | what's on my screen | describe my screen
                                  → send screen to Gemini vision, speak reply
