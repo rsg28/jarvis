@@ -68,11 +68,9 @@ DEFAULT_CONFIG = {
         "ack": "Yes?",
     },
     "llm": {
-        # LLM fallback (Gemini). When the regex intent table can't match a
-        # request, the raw transcript is sent to Gemini which either emits
-        # a canonical command (re-dispatched here) or a short chat reply.
-        # Get a free API key at https://aistudio.google.com/app/apikey
-        # or set the GEMINI_API_KEY env var.
+        # Language layer. Ollama (local) or Gemini. Natural speech is
+        # turned into a canonical command or a short chat reply.
+        # Phrase parsers in intents.py cover the model being offline.
         "enabled": False,
         "api_key": "",
         "model": "gemini-3.6-flash",
@@ -463,8 +461,38 @@ def _build_speaker_verifier(config):
 
 # ─────────────────────── loop drivers ───────────────────────
 
+def _start_phone(config: dict, dispatcher: CommandDispatcher, voice: Voice) -> None:
+    """LAN page so the phone can drive this same Jarvis. No-op when
+    [phone].enabled is false or the port cannot be bound."""
+    def _on_command(text: str, speak_on_pc: bool) -> str:
+        result = dispatcher.dispatch(text)
+        if speak_on_pc and result.speak:
+            threading.Thread(
+                target=voice.say, args=(result.speak,), daemon=True,
+            ).start()
+        parts = []
+        if result.speak:
+            parts.append(result.speak)
+        if result.print_out and result.print_out not in parts:
+            parts.append(result.print_out)
+        return "\n".join(parts) if parts else "(sin respuesta)"
+
+    try:
+        import phone as phone_mod
+        info = phone_mod.start(config, _on_command)
+    except Exception as exc:
+        logging.warning("[phone] failed to start: %s", exc)
+        return
+    if not info.running:
+        return
+    print(f"[phone] {info.url}")
+    print(f"[phone] pin {info.pin}   (también en phone_link.txt)")
+    logging.info("[phone] ready %s", info.url)
+
+
 def run_text_or_oneshot(config: dict, voice: Voice, use_voice: bool) -> int:
     dispatcher = CommandDispatcher(config=config, voice=voice)
+    _start_phone(config, dispatcher, voice)
     address = config["user"].get("address", "")
 
     listener = None
@@ -529,6 +557,7 @@ def run_ui_loop(config: dict, voice: Voice) -> int:
 
     guarded = GuardedUIVoice(voice)
     dispatcher = CommandDispatcher(config=config, voice=guarded)
+    _start_phone(config, dispatcher, voice)
 
     cmd_queue: "queue.Queue[str]" = queue.Queue()
 
@@ -607,6 +636,7 @@ def run_wake_loop(config: dict, voice: Voice) -> int:
     pause = threading.Event()
     guarded = GuardedVoice(voice, pause)
     dispatcher = CommandDispatcher(config=config, voice=guarded)
+    _start_phone(config, dispatcher, voice)
     address = config["user"].get("address", "")
 
     cmd_queue: "queue.Queue[str]" = queue.Queue()
@@ -1069,6 +1099,16 @@ def run_hotkey_loop(config: dict, voice: Voice) -> int:
                 logging.warning("[manga] boot check crashed: %s", exc)
         _th.Thread(target=_manga_boot_check, name="manga-boot-check",
                    daemon=True).start()
+
+    _start_phone(config, dispatcher, voice)
+    try:
+        import phone as _phone
+        if indicator is not None and _phone.STATE.running:
+            indicator.setToolTip(
+                f"Jarvis en el celular\n{_phone.STATE.url}\nPIN {_phone.STATE.pin}"
+            )
+    except Exception:
+        pass
 
     print(f"\n=== JARVIS · armed ===")
     print(f"Press {combo.upper()} from any app to talk. Ctrl+C to quit.\n")

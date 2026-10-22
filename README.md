@@ -262,12 +262,16 @@ Notes:
 - **Re-enroll** any time your voice changes noticeably (cold, mic
   swap, new headset) by rerunning `enroll_voice.py`.
 
-## Natural language (LLM fallback)
+## Natural language (Ollama / Gemini)
 
-Out of the box Jarvis matches commands with a regex table. That's fast
-and offline, but it means you have to phrase things a specific way.
+Jarvis does **not** use regular expressions for commands. Spoken or
+typed requests go to the LLM first (Ollama locally, or Gemini). The
+model returns either a canonical command or a short chat reply.
 
-Turn on the LLM fallback and Jarvis handles free-form requests too:
+If the model is offline, a phrase table in `intents.py` still handles
+exact commands like `quit`, `volume up`, `open spotify`.
+
+Turn on the LLM and you can say things like:
 
 - *"pon música chill en spotify"* → `play chill music`
 - *"sube el volumen un poquito"* → `volume up`
@@ -275,12 +279,9 @@ Turn on the LLM fallback and Jarvis handles free-form requests too:
 - *"cómo se dice hello en francés?"* → answers in French out loud
 - *"resume in one sentence what a raspberry pi is"* → short spoken answer
 
-When nothing in the built-in intent table matches, the transcript is
-sent to Gemini with a system prompt describing every canonical command
-Jarvis knows. Gemini either emits a canonical command (re-dispatched
-through the same code path as a typed one) or a short conversational
-reply that Jarvis speaks back. The last few exchanges are kept as
-context so follow-ups like *"and tomorrow?"* still work.
+The model either emits a canonical command (same code path as a typed
+one) or a short conversational reply. Recent exchanges stay in context
+so follow-ups like *"and tomorrow?"* still work.
 
 Enable it in `config.toml`:
 
@@ -365,21 +366,23 @@ favorite_league = "la liga"
 
 ## Add a new skill
 
-Drop one line into `INTENTS` in `commands.py`:
+Add a parser in `intents.py` (exact phrase or prefix, no regex) and
+one line in `INTENTS` in `commands.py`:
 
 ```python
-(r"^lock (my|the) (pc|screen)$",
- lambda d, m: d._open_app("terminal")),   # or write your own handler
+(exact("lock the pc", "lock my screen"),
+ lambda d, m: d._open_app("terminal"), False),
 ```
-
-That's it. Regex + callable. No framework, no boilerplate.
 
 ## Files
 
 ```
 python-tools/jarvis/
 ├── jarvis.py            entry point + boot sequence
-├── commands.py          intent table + dispatcher
+├── commands.py          dispatcher + intent table
+├── intents.py           phrase parsers (no regex)
+├── matchers.py          exact/prefix helpers
+├── llm_ollama.py        local Ollama backend
 ├── voice.py             edge-tts (neural) → SAPI5 fallback
 ├── news.py              Google News RSS
 ├── soccer.py            ESPN scoreboard JSON

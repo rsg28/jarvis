@@ -22,7 +22,6 @@ from __future__ import annotations
 
 import json
 import logging
-import re
 import time
 import urllib.error
 import urllib.request
@@ -33,6 +32,7 @@ from typing import Deque, Dict, List, Optional, Tuple
 # describe the same canonical skill set — any change (e.g. adding a new
 # command) propagates to both without duplication.
 from llm import SYSTEM_PROMPT
+from matchers import first_json_object, strip_fences
 
 
 DEFAULT_HOST  = "http://localhost:11434"
@@ -196,7 +196,7 @@ class OllamaLLM:
         # still emit prose. Promote to chat so the user hears something.
         # Guard: a reply that's just "{}" / "{...}" / "[]" is garbage
         # (Qwen does this during cold-start after an unload). Treat
-        # as failure so the dispatcher falls back to regex instead of
+        # as failure so the dispatcher falls back to phrase parsers instead of
         # speaking "{}" out loud.
         stripped = content.strip()
         if stripped in ("{}", "[]", "null", "{\"}") or len(stripped) < 3:
@@ -246,20 +246,16 @@ class OllamaLLM:
     # ─────────────────── helpers ───────────────────
     @staticmethod
     def _extract_json(text: str) -> Optional[Dict]:
-        """Strip fences and parse. format=json makes this almost always
-        a one-shot `json.loads`, but we keep the regex fallback for
-        the odd model that still wraps its output."""
-        s = text.strip()
-        s = re.sub(r"^```(?:json)?\s*", "", s)
-        s = re.sub(r"\s*```$", "", s)
+        """Strip fences and parse. format=json is usually enough."""
+        s = strip_fences(text)
         try:
             return json.loads(s)
         except Exception:
             pass
-        m = re.search(r"\{.*\}", s, re.DOTALL)
-        if m:
+        blob = first_json_object(s)
+        if blob:
             try:
-                return json.loads(m.group(0))
+                return json.loads(blob)
             except Exception:
                 return None
         return None

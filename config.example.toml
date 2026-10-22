@@ -41,6 +41,15 @@ enabled = true
 combo   = "ctrl+alt+j"          # any `keyboard` combo string works
 ack     = true                  # brief "Yes?" cue when activated
 
+[phone]
+# Page you open on your phone, same Wi-Fi as this PC. Commands run
+# here — the phone is a remote, not a second Jarvis. Say "link del
+# celular" and Jarvis reads the address and PIN out loud.
+# PIN: leave blank to generate one (saved in phone_pin.txt).
+enabled = true
+port    = 8765
+pin     = ""
+
 # Cancel-on-keyboard: if you were typing when the hotkey fired, or if
 # you start typing WHILE Jarvis is listening, the voice session is
 # dropped. The hotkey's own component keys (ctrl/alt/j in the default

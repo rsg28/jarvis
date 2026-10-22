@@ -1,22 +1,25 @@
 """
 Command dispatcher for Jarvis.
 
-Each intent is matched with a small regex + handler pair. Adding a new
-skill is dropping a new pair into `INTENTS` — nothing else changes.
+Ollama (or Gemini) turns natural language into a canonical command.
+Local fallback uses phrase parsers in intents.py — no regular expressions.
 """
 from __future__ import annotations
 
 import logging
 import os
 import platform
-import re
 import subprocess
+import threading
 import urllib.parse
 import webbrowser
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Callable, Optional
+
+from matchers import exact, prefix, slug_name
+import intents as I
 
 
 @dataclass
@@ -35,8 +38,8 @@ class CommandDispatcher:
         self.apps = config.get("apps", {})
         # Lazy scheduler — created on first timer/reminder
         self._scheduler = None
-        # Lazy LLM fallback — only built if [llm].enabled = true and a key
-        # is available. `None` means "regex-only mode".
+        # Lazy LLM — only built if [llm].enabled = true. `None` means
+        # phrase-parser mode only.
         from llm import build_from_config
         self._llm = build_from_config(config)
         # Lazy knowledge-base (RAG). Built on first use so startup stays
@@ -53,6 +56,9 @@ class CommandDispatcher:
         # chat input, VSCode editor, etc.) right before injecting input.
         # Set to None when no capture is available (text mode, tests).
         self._last_user_hwnd: Optional[int] = None
+        # Phone requests and the hotkey path can dispatch at the same
+        # time. RLock because dispatch() calls itself for LLM commands.
+        self._dispatch_lock = threading.RLock()
         # Auto-arm gaming-mode watcher if config says so. Starts the
         # background process poll immediately so a game launched right
         # after boot still triggers an auto VRAM release. Failure here
@@ -86,57 +92,47 @@ class CommandDispatcher:
 
     # ────────────── public entry point ──────────────
     def dispatch(self, text: str) -> CommandResult:
+        with self._dispatch_lock:
+            return self._dispatch_body(text)
+
+    def _dispatch_body(self, text: str) -> CommandResult:
         text = text.strip()
         if not text:
             return CommandResult()
 
-        # Dispatch order is config-driven. Default is `llm_first = true`
-        # when the LLM is available, because natural phrasings (which
-        # the user actually says) don't survive small wording changes
-        # against brittle regex. Regex becomes a deterministic fallback
-        # for when the LLM is rate-limited, offline, or disabled.
+        # Default is LLM-first (Ollama/Gemini). Phrase parsers are the
+        # offline fallback. A small critical set always runs locally
+        # so quit / volume / media still work if the model is unloaded.
         llm_cfg = self.config.get("llm") or {}
         llm_first = (self._llm is not None
                      and not self._in_llm_dispatch
                      and bool(llm_cfg.get("llm_first", True)))
 
-        # ── Safety net: a handful of commands must ALWAYS work
-        # instantly and locally — "quit", "stop listening", "help",
-        # media keys, volume — because they're used constantly and
-        # must survive a dead LLM. We check these up front even in
-        # llm-first mode so there's zero added latency on them.
         if llm_first:
-            for pattern in _CRITICAL_INTENT_PATTERNS:
-                if re.match(pattern, text, re.IGNORECASE):
-                    # Fall through to the regex loop below, which has
-                    # these in its table.
-                    for pat, handler in INTENTS:
-                        m = re.match(pat, text, re.IGNORECASE)
-                        if m:
-                            result = handler(self, m)
-                            self._remember(text, result)
-                            return result
+            for parse, handler, critical in INTENTS:
+                if not critical:
+                    continue
+                m = parse(text)
+                if m:
+                    result = handler(self, m)
+                    self._remember(text, result)
+                    return result
 
-        # ── LLM-first path (default when enabled) ──
         if llm_first:
             llm_result = self._try_llm(text)
             if llm_result is not None:
                 self._remember(text, llm_result)
                 return llm_result
-            # LLM failed (rate-limited, offline, no key, etc). Fall
-            # through to regex so the user still gets a reply.
-            logging.info("[dispatch] LLM failed, falling back to regex "
+            logging.info("[dispatch] LLM failed, falling back to phrases "
                          "(reason: %s)", getattr(self._llm, "last_error", None))
 
-        # ── Regex path (either regex-first mode, or LLM fallback) ──
-        for pattern, handler in INTENTS:
-            match = re.match(pattern, text, re.IGNORECASE)
+        for parse, handler, _critical in INTENTS:
+            match = parse(text)
             if match:
                 result = handler(self, match)
                 self._remember(text, result)
                 return result
 
-        # ── LLM try (if we were regex-first and regex missed) ──
         if not llm_first and self._llm is not None and not self._in_llm_dispatch:
             llm_result = self._try_llm(text)
             if llm_result is not None:
@@ -151,7 +147,7 @@ class CommandDispatcher:
             speak = (f"I don't have a command that matches \"{text}\", "
                      f"and {disabled}, so I can't improvise. "
                      f"Say help to see what I understand natively.")
-            tag = f"[jarvis] no regex match + llm off ({disabled})"
+            tag = f"[jarvis] no phrase match + llm off ({disabled})"
         elif self._in_llm_dispatch:
             # LLM produced a canonical command that itself didn't match —
             # unusual, but worth naming so we don't ping-pong silently.
@@ -163,7 +159,7 @@ class CommandDispatcher:
                   or "the language model had no useful reply"
             speak = (f"I don't have a built-in command for \"{text}\", "
                      f"and {why}. Try rephrasing, or say help.")
-            tag = f"[jarvis] no regex match + llm failed ({why})"
+            tag = f"[jarvis] no phrase match + llm failed ({why})"
         return CommandResult(
             speak=speak,
             print_out=f"{tag}: {text!r}",
@@ -261,8 +257,7 @@ class CommandDispatcher:
             # (type a snippet / forget a KB doc) never use those shapes.
             command = self._normalize_llm_command(command)
             # Re-dispatch the LLM's canonical command through the same
-            # regex table so the execution path is identical to a typed
-            # command. The re-entrancy guard prevents an LLM ping-pong.
+            # phrase table so the path matches a typed command.
             self._in_llm_dispatch = True
             # Preserve original user text (e.g. "olvida lo del cumple")
             # so handlers like _mem_forget can prune cross-language
@@ -303,13 +298,13 @@ class CommandDispatcher:
         # includes " content:" literally.
         if low.startswith("type ") and " content:" in low:
             return "write " + cmd[5:]
-        # "forget <path-with-extension>" -> "delete file <path>"
-        # The `forget` intent targets KB doc names, not .txt / .log /
-        # .py paths. A bare dotted extension means it's a real file.
-        import re as _re
-        m = _re.match(r"^forget\s+(.+\.[a-zA-Z0-9]{1,6})\s*$", cmd)
-        if m:
-            return f"delete file {m.group(1)}"
+        # "forget notes.txt" -> "delete file notes.txt"
+        if low.startswith("forget "):
+            rest = cmd[7:].strip()
+            if " " not in rest and "." in rest:
+                ext = rest.rsplit(".", 1)[-1]
+                if ext.isalnum() and 1 <= len(ext) <= 6:
+                    return f"delete file {rest}"
         return cmd
 
     def _remember(self, user_text: str, result: CommandResult) -> None:
@@ -1182,7 +1177,7 @@ class CommandDispatcher:
                 speak="Diagnose which URL?",
                 print_out="[web] empty url")
         # Accept bare domains too — add https:// so urllib works.
-        if not re.match(r"^https?://", url, re.IGNORECASE):
+        if not (url.lower().startswith("http://") or url.lower().startswith("https://")):
             url = "https://" + url.lstrip("/")
         try:
             import web as _web
@@ -1212,8 +1207,11 @@ class CommandDispatcher:
             except Exception:
                 query = ""
         # Trim trailing filler like "please", "today", "right now".
-        query = re.sub(r"\s+(please|today|now|right\s+now)\s*$", "", query,
-                       flags=re.IGNORECASE).strip()
+        q_fold = query.lower().rstrip()
+        for tail in (" please", " today", " now", " right now"):
+            if q_fold.endswith(tail):
+                query = query[: len(query) - len(tail)].rstrip()
+                q_fold = query.lower().rstrip()
 
         try:
             import manga_watch as mw
@@ -1229,9 +1227,20 @@ class CommandDispatcher:
         # ch N"); if not watched, fall through to a one-shot lookup.
         if query:
             series_list = (self.config.get("manga", {}) or {}).get("series") or []
-            q_tokens = set(re.findall(r"[a-z0-9]+", query.lower()))
+            def _alnum_tokens(s: str) -> set[str]:
+                buf, out = [], set()
+                for ch in (s or "").lower():
+                    if ch.isalnum():
+                        buf.append(ch)
+                    elif buf:
+                        out.add("".join(buf))
+                        buf = []
+                if buf:
+                    out.add("".join(buf))
+                return out
+            q_tokens = _alnum_tokens(query)
             def _overlap(name: str) -> float:
-                nt = set(re.findall(r"[a-z0-9]+", (name or "").lower()))
+                nt = _alnum_tokens(name)
                 return len(q_tokens & nt) / max(1, len(q_tokens))
             scored = [(s, _overlap(s.get("name", ""))) for s in series_list]
             scored.sort(key=lambda x: x[1], reverse=True)
@@ -2282,8 +2291,7 @@ class CommandDispatcher:
                                  print_out="[scaffold] no name")
 
         # Normalise name: lower-snake for python/rust, lower-kebab elsewhere.
-        import re as _re
-        safe_name = _re.sub(r"[^a-z0-9_-]+", "-", name.lower()).strip("-_")
+        safe_name = slug_name(name)
         if not safe_name:
             return CommandResult(speak=f"'{name}' isn't a usable project name.",
                                  print_out=f"[scaffold] empty safe name")
@@ -2574,6 +2582,30 @@ class CommandDispatcher:
                                  else stderr[:4000] + "\n... (truncated)")
         return CommandResult(speak=spoken, print_out="\n".join(printed_lines))
 
+    def _phone_link(self, _match=None) -> CommandResult:
+        """Speak the LAN address and PIN so the user can open Jarvis
+        on their phone. The server itself is started at boot."""
+        try:
+            import phone as phone_mod
+        except Exception as exc:
+            return CommandResult(
+                speak="The phone link isn't available.",
+                print_out=f"[phone] import failed: {exc}")
+        if not phone_mod.STATE.running or not phone_mod.STATE.url:
+            return CommandResult(
+                speak=("The phone link is off. Set phone.enabled to true "
+                       "in the config and restart me."),
+                print_out="[phone] server not running")
+        url = phone_mod.STATE.url
+        pin = phone_mod.STATE.pin
+        host = url.split("://", 1)[-1]
+        spoken_host = host.replace(".", ", ").replace(":", ", puerto ")
+        spoken_pin = ", ".join(pin)
+        return CommandResult(
+            speak=(f"En el celular, misma red wifi, abre {spoken_host}. "
+                   f"El pin es {spoken_pin}."),
+            print_out=f"[phone] {url}   pin {pin}")
+
     def _quit(self, _match) -> CommandResult:
         return CommandResult(speak="Signing off. Have a productive day.",
                              print_out="[jarvis] goodbye", should_exit=True)
@@ -2585,382 +2617,162 @@ class CommandDispatcher:
         return CommandResult(speak="Standing by, sir. Just say 'hey jarvis' when you need me.")
 
 
-# ────────────── critical fast-path (always local) ──────────────
-# A handful of commands MUST work in microseconds and must survive a
-# dead/rate-limited LLM: process-control (quit/stop), help, media
-# transport (play/pause/next/prev/volume). In LLM-first mode we match
-# these up front so there's zero added latency on them. Everything
-# else routes through the LLM for natural-phrasing tolerance.
-_CRITICAL_INTENT_PATTERNS = [
-    r"^__stop_listening__$",
-    r"^(?:quit|exit|bye|goodbye|shutdown|apagate|cierrate|cerrar)$",
-    r"^(?:stop\s+listening|stop)$",
-    r"^(?:help|what\s+can\s+you\s+do|commands?|ayuda)$",
-    # Media keys — zero-latency essential for a voice assistant.
-    r"^(?:pause|play|resume|toggle\s+playback|pausa|reanuda)$",
-    r"^(?:next(?:\s+(?:song|track))?|skip|siguiente)$",
-    r"^(?:previous(?:\s+(?:song|track))?|back|prev|anterior)$",
-    # Volume shortcuts.
-    r"^(?:volume\s+up|louder|sube\s+(?:el\s+)?volumen)(?:\s+\d+)?$",
-    r"^(?:volume\s+down|quieter|baja\s+(?:el\s+)?volumen)(?:\s+\d+)?$",
-    r"^(?:mute|unmute|silencio)$",
-    # VRAM management — these are plumbing, not NLP, and must work
-    # even when the LLM is unloaded (which is the whole point).
-    r"^(?:release\s+vram|release\s+gpu|unload\s+model(?:s)?|free\s+vram|free\s+gpu|voy\s+a\s+jugar)$",
-    r"^(?:reclaim\s+vram|warm\s+up(?:\s+model)?|wake\s+up|preload\s+model|carga\s+el\s+modelo)$",
-    r"^(?:vram\s+status|gpu\s+status|whats?\s+(?:in\s+)?vram|que\s+hay\s+en\s+(?:la\s+)?vram)$",
-    # Gaming-mode toggle — same reason as VRAM: plumbing, not NLP.
-    r"^(?:gaming\s+mode\s+on|arm\s+gaming\s+mode|modo\s+gaming\s+on|activa\s+modo\s+gaming)$",
-    r"^(?:gaming\s+mode\s+off|disarm\s+gaming\s+mode|modo\s+gaming\s+off|apaga\s+modo\s+gaming)$",
-    r"^(?:gaming\s+mode\s+status|modo\s+gaming\s+status|estado\s+(?:del\s+)?modo\s+gaming)$",
-]
-
-
 # ────────────── intent table ──────────────
-# Order matters: the first match wins.
-INTENTS: list[tuple[str, Callable[["CommandDispatcher", re.Match], CommandResult]]] = [
-    (r"^__stop_listening__$",
-     lambda d, m: d._stop_listening(m)),
-    (r"^(help|what can you do|commands)$",
-     lambda d, m: d._help(m)),
-    (r"^(quit|exit|bye|goodbye|shutdown)$",
-     lambda d, m: d._quit(m)),
+# (parser, handler, critical). First match wins. Critical rows run
+# locally even when Ollama is first, so quit/volume/media stay instant.
 
-    (r"^(what.?s the time|what time is it|current time|time)$",
-     lambda d, m: d._time_now(m)),
-    (r"^(what day is it|what.?s the date|today.?s date|date)$",
-     lambda d, m: d._date_today(m)),
+C = True
+N = False
 
-    (r"^weather(?:\s+(?:in|at)\s+(?P<loc>.+))?$",
-     lambda d, m: d._weather(m)),
+INTENTS: list[tuple[Callable, Callable, bool]] = [
+    (I.exact_stop, lambda d, m: d._stop_listening(m), C),
+    (I.exact_help, lambda d, m: d._help(m), C),
+    (I.exact_phone, lambda d, m: d._phone_link(m), C),
+    (I.exact_quit, lambda d, m: d._quit(m), C),
 
-    # News
-    (r"^(?:news|headlines)(?:\s+(?:about\s+|on\s+)?(?P<topic>.+))?$",
-     lambda d, m: d._news(m)),
-    (r"^(?:what.?s\s+(?:new|happening)(?:\s+in\s+(?P<topic>.+))?)$",
-     lambda d, m: d._news(m)),
+    (exact("what time is it", "whats the time", "current time", "time"),
+     lambda d, m: d._time_now(m), N),
+    (exact("what day is it", "whats the date", "todays date", "date"),
+     lambda d, m: d._date_today(m), N),
 
-    # Soccer
-    (r"^(?:scores|score|soccer|football|fixtures|matches)(?:\s+(?P<q>.+))?$",
-     lambda d, m: d._soccer(m)),
-    (r"^who(?:'s| is)\s+playing(?:\s+in\s+(?P<q>.+))?(?:\s+today)?$",
-     lambda d, m: d._soccer(m)),
+    (I.parse_weather, lambda d, m: d._weather(m), N),
+    (I.parse_news, lambda d, m: d._news(m), N),
+    (I.parse_soccer, lambda d, m: d._soccer(m), N),
 
-    # System info — battery / cpu / ram / disk / ip / wifi
-    (r"^(?:what.?s\s+(?:the|my)\s+)?(?P<key>battery|cpu|ram|memory|disk|storage|ip|network|wifi|wi-fi)(?:\s+.*)?$",
-     lambda d, m: d._system(m.group("key").replace("wi-fi", "wifi").replace("storage", "disk").replace("network", "ip"))),
+    (I.parse_system, lambda d, m: d._system(m.group("key")), N),
 
-    # Volume
-    (r"^(?:volume\s+up|louder|turn\s+it\s+up)(?:\s+(?P<n>\d+))?$",
-     lambda d, m: d._volume("up", int(m.group("n") or 5))),
-    (r"^(?:volume\s+down|quieter|turn\s+it\s+down)(?:\s+(?P<n>\d+))?$",
-     lambda d, m: d._volume("down", int(m.group("n") or 5))),
-    (r"^(?:mute|unmute)$",
-     lambda d, m: d._volume("mute")),
-    (r"^set\s+volume\s+(?:to\s+)?(?P<n>\d+)%?$",
-     lambda d, m: d._volume("set", int(m.group("n")))),
-    (r"^(?:what.?s\s+the\s+volume|volume|current\s+volume)$",
-     lambda d, m: d._volume("get")),
+    (I.parse_volume_up, lambda d, m: d._volume("up", int(m.group("n") or 5)), C),
+    (I.parse_volume_down, lambda d, m: d._volume("down", int(m.group("n") or 5)), C),
+    (I.exact_mute, lambda d, m: d._volume("mute"), C),
+    (I.parse_set_volume, lambda d, m: d._volume("set", int(m.group("n"))), N),
+    (exact("whats the volume", "volume", "current volume"),
+     lambda d, m: d._volume("get"), N),
 
-    # Media control (media keys work with Spotify, YouTube, VLC, etc.)
-    (r"^(?:pause|play|resume|toggle\s+playback)$",
-     lambda d, m: d._media("toggle")),
-    (r"^(?:next(?:\s+(?:song|track))?|skip)$",
-     lambda d, m: d._media("next")),
-    (r"^(?:previous(?:\s+(?:song|track))?|back|prev)$",
-     lambda d, m: d._media("prev")),
+    (I.exact_pause, lambda d, m: d._media("toggle"), C),
+    (I.exact_next, lambda d, m: d._media("next"), C),
+    (I.exact_prev, lambda d, m: d._media("prev"), C),
 
-    # Screenshot
-    (r"^(?:screenshot|screen\s+shot|capture\s+screen|take\s+a\s+screenshot)$",
-     lambda d, m: d._screenshot(m)),
+    (exact("screenshot", "screen shot", "capture screen", "take a screenshot"),
+     lambda d, m: d._screenshot(m), N),
 
-    # ───── File ops (Phase 1) — MUST come before the type regex,
-    # because the type regex accepts `write` as an alias and would
-    # swallow `write foo content: bar` into _type_text otherwise.
-    (r"^write\s+(?P<path>\S.+?)\s+content:\s*(?P<content>.*)$",
-     lambda d, m: d._write_file(m.group("path").strip(), m.group("content"))),
-    (r"^append(?:\s+to)?\s+(?P<path>\S.+?)\s+content:\s*(?P<content>.*)$",
-     lambda d, m: d._write_file(m.group("path").strip(),
-                                m.group("content"), append=True)),
-    (r"^delete\s+file\s+(?P<path>.+)$",
-     lambda d, m: d._delete_file(m.group("path").strip())),
-    (r"^(?:make|create)\s+(?:folder|directory|dir)\s+(?P<path>.+)$",
-     lambda d, m: d._mkdir(m.group("path").strip())),
-    (r"^remove\s+(?:folder|directory|dir)\s+(?P<path>.+)$",
-     lambda d, m: d._remove_folder(m.group("path").strip())),
-    (r"^(?:list|ls)\s+(?P<path>.+)$",
-     lambda d, m: d._list_dir(m.group("path").strip())),
+    (I.parse_write, lambda d, m: d._write_file(m.group("path").strip(),
+                                              m.group("content")), N),
+    (I.parse_append, lambda d, m: d._write_file(m.group("path").strip(),
+                                               m.group("content"), append=True), N),
+    (prefix("delete file", rest="path"),
+     lambda d, m: d._delete_file(m.group("path").strip()), N),
+    (prefix("make folder", "create folder", "make directory", "create directory",
+            "make dir", "create dir", rest="path"),
+     lambda d, m: d._mkdir(m.group("path").strip()), N),
+    (prefix("remove folder", "remove directory", "remove dir", rest="path"),
+     lambda d, m: d._remove_folder(m.group("path").strip()), N),
+    (prefix("list", "ls", rest="path"),
+     lambda d, m: d._list_dir(m.group("path").strip()), N),
 
-    # Type text into the focused window. Snippet substitution:
-    # `type my email` -> config[snippets][email].
-    # NOTE: `write` is intentionally NOT listed here anymore — it's
-    # now reserved for the file-creation intent above. `escribe`
-    # stays because the LLM normally routes it to `type`, but the
-    # regex fallback should still handle it for offline/direct use.
-    (r"^(?:type|escribe|escribir)\s+(?P<t>.+)$",
-     lambda d, m: d._type_text(m.group("t"))),
+    (prefix("type", "escribe", "escribir", rest="t"),
+     lambda d, m: d._type_text(m.group("t")), N),
+    (prefix("press", "hit", "pulsa", "presiona", rest="k"),
+     lambda d, m: d._press_key(m.group("k").replace(" key", "").strip()), N),
+    (exact("enter", "return", "tab", "escape", "esc", "backspace", "delete",
+           "space", "home", "end", "page up", "page down", "up", "down",
+           "left", "right"),
+     lambda d, m: d._press_key(m.text), N),
 
-    # Press a single key or combo: `press enter`, `press tab`, `press ctrl a`.
-    (r"^(?:press|hit|pulsa|presiona)\s+(?P<k>[a-z0-9 +]+?)\s*(?:key)?$",
-     lambda d, m: d._press_key(m.group("k"))),
-    # Shorthand: bare key words.
-    (r"^(?:enter|return|tab|escape|esc|backspace|delete|space|home|end|"
-     r"page\s+up|page\s+down|up|down|left|right)$",
-     lambda d, m: d._press_key(m.group(0))),
+    (I.parse_see_screen, lambda d, m: d._see_screen(m.group("prompt") or ""), N),
+    (I.parse_see_this, lambda d, m: d._see_screen(m.text), N),
 
-    # Screen vision — "what's on my screen", "read my screen",
-    # "describe the screen", "que hay en la pantalla",
-    # "what does the error say", etc. The optional `<prompt>` capture
-    # forwards anything after the trigger phrase as extra context.
-    (r"^(?:what.?s\s+on\s+(?:my\s+|the\s+)?(?:screen|monitor|pantalla)"
-     r"|what\s+do\s+i\s+see"
-     r"|describe\s+(?:my\s+|the\s+)?(?:screen|monitor|display|pantalla)"
-     r"|read\s+(?:my\s+|the\s+)?(?:screen|monitor|pantalla)"
-     r"|look\s+at\s+(?:my\s+|the\s+)?(?:screen|monitor|pantalla)"
-     r"|see\s+(?:my\s+|the\s+)?(?:screen|monitor|pantalla)"
-     r"|qu[eé]\s+(?:hay|se\s+ve|dice)\s+en\s+(?:mi\s+|la\s+)?pantalla"
-     r"|mira\s+(?:mi\s+|la\s+)?pantalla)"
-     r"(?:\s+(?P<prompt>.+))?\s*\??$",
-     lambda d, m: d._see_screen(m.group("prompt") or "")),
+    (I.parse_timer, lambda d, m: d._timer(m), N),
+    (exact("pomodoro"), lambda d, m: d._pomodoro(m), N),
+    (I.parse_remind, lambda d, m: d._remind(m), N),
+    (exact("list timers", "timers", "active jobs", "reminders"),
+     lambda d, m: d._list_jobs(m), N),
+    (exact("cancel all timers", "cancel timers", "cancel all reminders",
+           "cancel reminders", "cancel all jobs", "cancel jobs"),
+     lambda d, m: d._cancel_jobs(m), N),
 
-    # Follow-up style: "what does this say", "translate this",
-    # "explain this error" — all read the current screen with the
-    # question as the prompt.
-    (r"^(?:what\s+does\s+this\s+(?:say|mean|show)"
-     r"|translate\s+this"
-     r"|explain\s+this(?:\s+(?:error|code|screen))?"
-     r"|summarize\s+this"
-     r"|summarise\s+this)\s*\??$",
-     lambda d, m: d._see_screen(m.group(0))),
+    (I.parse_kb_learn, lambda d, m: d._kb_learn(m.group("q")), N),
+    (I.parse_kb_list, lambda d, m: d._kb_list(m), N),
+    (I.parse_kb_forget_doc, lambda d, m: d._kb_forget(m.group("q")), N),
+    (exact("forget all docs", "forget all documents", "forget everything in the kb",
+           "forget the kb", "olvida todo del kb"),
+     lambda d, m: d._kb_forget("everything"), N),
 
-    # Timers / Pomodoro / Reminders
-    (r"^(?:set\s+(?:a\s+)?timer(?:\s+for)?\s+|timer\s+)(?P<dur>.+)$",
-     lambda d, m: d._timer(m)),
-    (r"^pomodoro$",
-     lambda d, m: d._pomodoro(m)),
-    (r"^remind\s+me\s+in\s+(?P<dur>.+?)\s+to\s+(?P<what>.+)$",
-     lambda d, m: d._remind(m)),
-    (r"^(?:list\s+timers|timers|active\s+jobs|reminders)$",
-     lambda d, m: d._list_jobs(m)),
-    (r"^cancel\s+(?:all\s+)?(?:timers|reminders|jobs)$",
-     lambda d, m: d._cancel_jobs(m)),
+    (I.parse_diagnose, lambda d, m: d._diagnose_url(m.group("url")), N),
 
-    # ───── Knowledge base (RAG) ─────
-    # Ingest: "learn <path>", "study <path>", "aprende de <path>",
-    #         "remember this file <path>", "ingest <path>"
-    # NOTE: `remember` without `this` is intentionally NOT a KB verb —
-    # that routes to the long-term memory layer (Phase 9). `remember
-    # this <path>` and `remember this file <path>` still work for KB.
-    (r"^(?:learn(?:\s+from)?|study|read\s+and\s+remember|remember\s+this(?:\s+file)?|ingest"
-     r"|aprende(?:\s+de)?|aprende\s+este\s+(?:archivo|documento)"
-     r"|memoriza\s+este)\s+(?P<q>.+?)\s*\??$",
-     lambda d, m: d._kb_learn(m.group("q"))),
-    # List: "what documents do you know", "list my documents", "what have you learned"
-    (r"^(?:what\s+documents?\s+do\s+you\s+(?:know|have|remember)"
-     r"|list\s+(?:my\s+)?documents?"
-     r"|what\s+(?:files|docs)\s+have\s+you\s+learned"
-     r"|qu[eé]\s+documentos?\s+(?:tienes|conoces|sabes)"
-     r"|lista\s+(?:los\s+)?documentos?"
-     r"|knowledge\s+base|kb\s+list)\s*\??$",
-     lambda d, m: d._kb_list(m)),
-    # Forget a doc from the KB. Requires an explicit disambiguator
-    # (document / doc / file / archivo / documento) because plain
-    # "forget X" now routes to the long-term memory layer (Phase 9).
-    # "forget everything" / "forget all" wipes the KB.
-    (r"^(?:unlearn|forget\s+(?:the\s+)?(?:document|doc|file|archivo|documento))\s+"
-     r"(?P<q>.+?)\s*\??$",
-     lambda d, m: d._kb_forget(m.group("q"))),
-    (r"^(?:forget|olvida)\s+(?:all\s+(?:docs|documents)|everything\s+in\s+(?:the\s+)?kb|the\s+kb|todo\s+del\s+kb)$",
-     lambda d, m: d._kb_forget("everything")),
+    (I.parse_manga_check, lambda d, m: d._manga_check(m.group("q") or ""), N),
+    (I.parse_manga_latest, lambda d, m: d._manga_latest(m.group("q")), N),
 
-    # Diagnose a URL / page. Catches:
-    #   "diagnose https://..." / "check this url" / "why is this page broken"
-    #   "why won't https://... load" / "what's wrong with https://..."
-    #   "averigua el error de <url>" / "por que no carga <url>"
-    (r"^(?:diagnose|debug|inspect|check|averigua(?:\s+el\s+error\s+de)?"
-     r"|por\s+qu[eé]\s+no\s+carga|why\s+(?:won.?t|isn.?t|is).{0,40}?load(?:ing)?"
-     r"|what(?:'s|\s+is)\s+wrong\s+with)\s+(?:this\s+url\s+|this\s+page\s+|the\s+url\s+|the\s+page\s+)?"
-     r"(?P<url>https?://\S+)\s*\??$",
-     lambda d, m: d._diagnose_url(m.group("url"))),
-    # Short form when the URL is on its own line and the user already
-    # said "diagnose this" in a prior turn: just a bare URL triggers
-    # diagnose when prefixed with "why won't it load", etc.
-    (r"^(?:why\s+(?:won.?t|isn.?t)\s+(?:it|this|the\s+page)\s+load"
-     r"|why\s+is\s+this\s+(?:not\s+loading|broken)"
-     r"|what.?s\s+wrong\s+with\s+this\s+page"
-     r"|diagnose\s+(?:this|it)|debug\s+(?:this|it))\s*\??\s+"
-     r"(?P<url>https?://\S+)\s*\??$",
-     lambda d, m: d._diagnose_url(m.group("url"))),
-    # Bare URL after an explicit diagnose intent in natural phrasing
-    (r"^(?P<url>https?://\S+)\s+(?:won.?t\s+load|isn.?t\s+loading|is\s+broken|no\s+carga)\s*\.?$",
-     lambda d, m: d._diagnose_url(m.group("url"))),
-    # "why won't <url> load" / "why isn't <url> working" — URL in the middle
-    (r"^(?:why\s+(?:won.?t|isn.?t|doesn.?t)\s+|por\s+qu[eé]\s+no\s+(?:carga|funciona)\s+)"
-     r"(?P<url>https?://\S+)"
-     r"(?:\s+(?:load|loading|work|working|cargar|funcionar))?\s*\??$",
-     lambda d, m: d._diagnose_url(m.group("url"))),
+    (prefix("read", "open and read", "show me", rest="q"),
+     lambda d, m: d._read_file(m.group("q").strip()), N),
+    (prefix("whats in the file", "whats in file", rest="q"),
+     lambda d, m: d._read_file(m.group("q").strip()), N),
+    (prefix("find", "locate", "where is", rest="q"),
+     lambda d, m: d._find(m.group("q").strip()), N),
 
-    # ───── Manga watcher ─────
-    # Broad "any new chapters?" style, with optional "of <series>".
-    # Catches: "check for new chapters", "is there a new chapter of X",
-    #          "check if there is a new episode of X", "any update on X",
-    #          "did X update", "has X updated", "new episode of X",
-    #          "manga update", "hay un nuevo capitulo de X", etc.
-    # "episode" is accepted as a synonym for "chapter" because voice STT
-    # often transcribes it that way (and manga/anime are near-synonyms
-    # in casual speech).
-    (r"^(?:"
-     r"(?:please\s+)?check\s+(?:(?:if\s+there\s+(?:is|are)\s+)|(?:for\s+))?"
-     r"(?:(?:a|any)\s+)?(?:new\s+)?(?:manga\s+)?(?:chapters?|episodes?|updates?)"
-     r"|is\s+there\s+(?:a\s+|any\s+)?new\s+(?:chapter|episode|update)"
-     r"|are\s+there\s+(?:any\s+)?new\s+(?:chapters?|episodes?|updates?)"
-     r"|any\s+(?:new\s+)?(?:manga\s+)?(?:chapters?|episodes?|updates?)"
-     r"|new\s+(?:chapters?|episodes?)"
-     r"|(?:did|has|have)\s+(?P<q2>.+?)\s+(?:update|updated|dropped?)"
-     r"|manga\s+(?:update|check)"
-     r"|hay\s+(?:un\s+)?nuevo\s+(?:cap[ií]tulo|cap|episodio)"
-     r"|(?:checa|revisa|mira|f[ií]jate|chequea)\s+(?:si\s+hay\s+)?(?:un\s+)?"
-     r"(?:nuevo\s+)?(?:cap[ií]tulo|cap|episodio|actualizaci[oó]n)"
-     r")"
-     r"(?:\s+(?:of|for|on|about|de|del?)\s+(?P<q>.+?))?"
-     r"\s*\??$",
-     lambda d, m: d._manga_check(m.group("q") or m.group("q2") or "")),
-    # One-off lookup: "latest chapter of <series>", "what chapter is X on"
-    (r"^(?:what(?:'s|\s+is)\s+the\s+latest\s+(?:chapter|episode)\s+of"
-     r"|latest\s+(?:chapter|episode)\s+of"
-     r"|how\s+many\s+chapters?\s+of"
-     r"|what\s+chapter\s+is"
-     r"|cu[aá]l\s+es\s+el\s+(?:[uú]ltimo\s+)?(?:cap[ií]tulo|cap)\s+de"
-     r"|en\s+qu[eé]\s+(?:cap[ií]tulo|cap)\s+(?:va|est[aá])"
-     r"|qu[eé]\s+(?:cap[ií]tulo|cap)\s+(?:salio|sacaron|hay))"
-     r"\s+(?P<q>.+?)\s*(?:\s+on)?\s*\??$",
-     lambda d, m: d._manga_latest(m.group("q"))),
+    (exact("joke", "tell me a joke"), lambda d, m: d._joke(m), N),
+    (exact("trivia", "random fact", "fun fact"), lambda d, m: d._trivia(m), N),
 
-    # Jokes / trivia
-    (r"^(?:tell\s+me\s+a\s+)?joke$",
-     lambda d, m: d._joke(m)),
-    (r"^(?:trivia|random\s+fact|fun\s+fact)$",
-     lambda d, m: d._trivia(m)),
+    (prefix("speak", "switch to", rest="lang"),
+     lambda d, m: d._speak_lang(m.group("lang").strip()), N),
 
-    # Voice language toggle
-    (r"^(?:speak|switch\s+to)\s+(?P<lang>english|spanish|french|british)$",
-     lambda d, m: d._speak_lang(m.group("lang"))),
+    (prefix("remember that", "remember", rest="f"),
+     lambda d, m: d._mem_remember(m.group("f").strip()), N),
+    (prefix("memory forget", "forget", rest="q"),
+     lambda d, m: d._mem_forget(m.group("q").strip(), raw=m.string), N),
+    (I.parse_mem_know,
+     lambda d, m: d._mem_what_do_you_know((m.group("q") or "").strip()), N),
+    (exact("recent memory", "memory recent", "conversation history", "history"),
+     lambda d, m: d._mem_recent(m), N),
+    (exact("clear recent memory", "clear recent", "clear history", "forget recent"),
+     lambda d, m: d._mem_clear_recent(m), N),
 
-    # Read a file by name or path — speaks an excerpt, prints the whole thing.
-    (r"^(?:read|open\s+and\s+read|show(?:\s+me)?)\s+(?:the\s+(?:file\s+)?|file\s+)?(?P<q>.+)$",
-     lambda d, m: d._read_file(m.group("q").strip())),
-    (r"^what.?s\s+in\s+(?:the\s+file\s+|file\s+|my\s+)?(?P<q>.+?)\s*\??$",
-     lambda d, m: d._read_file(m.group("q").strip())),
+    (I.exact_game_on, lambda d, m: d._gaming_on(m), C),
+    (I.exact_game_off, lambda d, m: d._gaming_off(m), C),
+    (I.exact_game_stat, lambda d, m: d._gaming_status(m), C),
 
-    # Find a target without opening it — great for disambiguation.
-    (r"^(?:find|locate|where\s+is)\s+(?P<q>.+?)\s*\??$",
-     lambda d, m: d._find(m.group("q").strip())),
+    (I.exact_vram_off, lambda d, m: d._vram_release(m), C),
+    (I.exact_vram_on, lambda d, m: d._vram_reclaim(m), C),
+    (I.exact_vram_stat, lambda d, m: d._vram_status(m), C),
 
-    # ───── Memory (Phase 9) ─────
-    # Explicit canonical phrasings. LLM translates natural language
-    # into these; regex catches direct uses too.
-    (r"^remember\s+(?:that\s+)?(?P<f>.+)$",
-     lambda d, m: d._mem_remember(m.group("f").strip())),
-    (r"^(?:memory\s+)?forget\s+(?P<q>.+)$",
-     lambda d, m: d._mem_forget(m.group("q").strip(), raw=m.string)),
-    (r"^(?:what\s+do\s+you\s+(?:remember|know)(?:\s+about\s+(?P<q>.+))?"
-     r"|what\s+memories\s+do\s+you\s+have"
-     r"|(?:list|show)\s+(?:your\s+)?memor(?:y|ies))\s*\??$",
-     lambda d, m: d._mem_what_do_you_know((m.group("q") or "").strip())),
-    (r"^(?:recent\s+memory|memory\s+recent|conversation\s+history|history)$",
-     lambda d, m: d._mem_recent(m)),
-    (r"^(?:clear\s+recent(?:\s+memory)?|clear\s+history|forget\s+recent)$",
-     lambda d, m: d._mem_clear_recent(m)),
+    (I.parse_watch_start, lambda d, m: d._watch_start(
+        interval_s=(int(m.group("n")) * (60 if (m.group("unit") or "s").startswith("m") else 1))
+        if m.group("n") else None), N),
+    (exact("stop watching screen", "stop watching", "stop screen watch"),
+     lambda d, m: d._watch_stop(m), N),
+    (exact("screen activity", "screen watch status", "watch status"),
+     lambda d, m: d._watch_status(m), N),
 
-    # ───── Gaming mode (Phase 8) ─────
-    (r"^(?:gaming\s+mode\s+on|arm\s+gaming\s+mode|modo\s+gaming\s+on|activa\s+modo\s+gaming)$",
-     lambda d, m: d._gaming_on(m)),
-    (r"^(?:gaming\s+mode\s+off|disarm\s+gaming\s+mode|modo\s+gaming\s+off|apaga\s+modo\s+gaming)$",
-     lambda d, m: d._gaming_off(m)),
-    (r"^(?:gaming\s+mode\s+status|modo\s+gaming\s+status|estado\s+(?:del\s+)?modo\s+gaming)$",
-     lambda d, m: d._gaming_status(m)),
+    (exact("mouse position"), lambda d, m: d._mouse_pos(), N),
+    (exact("test typing", "typing test", "diagnose typing", "prueba de escribir",
+           "prueba escribir"),
+     lambda d, m: d._test_typing(), N),
+    (I.parse_mouse_move, lambda d, m: d._mouse_move(m.group("x"), m.group("y")), N),
+    (lambda t: I.parse_click(t, "left", 2),
+     lambda d, m: d._mouse_click("left", m.group("x") or None, m.group("y") or None, clicks=2), N),
+    (lambda t: I.parse_click(t, "right", 1),
+     lambda d, m: d._mouse_click("right", m.group("x") or None, m.group("y") or None), N),
+    (lambda t: I.parse_click(t, "middle", 1),
+     lambda d, m: d._mouse_click("middle", m.group("x") or None, m.group("y") or None), N),
+    (lambda t: I.parse_click(t, "left", 1),
+     lambda d, m: d._mouse_click("left", m.group("x") or None, m.group("y") or None), N),
+    (I.parse_scroll, lambda d, m: d._mouse_scroll(m.group("dir"), int(m.group("n") or 3)), N),
+    (I.parse_drag, lambda d, m: d._mouse_drag(m.group("x1"), m.group("y1"),
+                                             m.group("x2"), m.group("y2")), N),
 
-    # ───── VRAM management (Phase 7) ─────
-    # Free the GPU for games / wake it back up / check what's resident.
-    (r"^(?:release\s+vram|release\s+gpu|unload\s+model(?:s)?|free\s+vram|free\s+gpu|voy\s+a\s+jugar)$",
-     lambda d, m: d._vram_release(m)),
-    (r"^(?:reclaim\s+vram|warm\s+up(?:\s+model)?|wake\s+up|preload\s+model|carga\s+el\s+modelo)$",
-     lambda d, m: d._vram_reclaim(m)),
-    (r"^(?:vram\s+status|gpu\s+status|whats?\s+(?:in\s+)?vram|que\s+hay\s+en\s+(?:la\s+)?vram)$",
-     lambda d, m: d._vram_status(m)),
+    (I.parse_scaffold, lambda d, m: d._scaffold_project(m.group("stack"),
+                                                       m.group("name").strip()), N),
+    (I.parse_run, lambda d, m: d._run_shell(m.group("cmd").strip()), N),
 
-    # ───── Screen watch (Phase 6) ─────
-    # Pixel-diff daemon. See screen_watch.py for the sampling loop.
-    (r"^watch\s+screen(?:\s+every\s+(?P<n>\d+)\s*(?P<unit>s|sec|secs|seconds?|m|min|mins|minutes?)?)?$",
-     lambda d, m: d._watch_start(
-         interval_s=(int(m.group("n")) * (60 if (m.group("unit") or "s").startswith("m") else 1))
-                    if m.group("n") else None)),
-    (r"^(?:stop\s+watching(?:\s+screen)?|stop\s+screen\s+watch)$",
-     lambda d, m: d._watch_stop(m)),
-    (r"^(?:screen\s+activity|screen\s+watch\s+status|watch\s+status)$",
-     lambda d, m: d._watch_status(m)),
+    (prefix("open", "launch", "start", rest="app"),
+     lambda d, m: d._open_app(m.group("app").strip()), N),
 
-    # ───── Mouse control (Phase 5) ─────
-    # Coord-based ops only. Visual grounding ("click on the login
-    # button") will come in a later phase once we pick a vision model.
-    (r"^mouse\s+position$",
-     lambda d, m: d._mouse_pos()),
+    (prefix("google", "search for", "search", "look up", rest="q"),
+     lambda d, m: d._search_web(m.group("q").strip()), N),
 
-    # Self-test: diagnose typing-focus. Says "typing in 5 seconds",
-    # user clicks target, Jarvis types `jarvis test 12345` and logs
-    # every hwnd transition for post-mortem.
-    (r"^(?:test\s+typing|typing\s+test|diagnose\s+typing|prueba\s+(?:de\s+)?escribir)$",
-     lambda d, m: d._test_typing()),
-    (r"^(?:move\s+(?:mouse\s+)?(?:to\s+)?|move\s+cursor\s+to\s+)"
-     r"(?P<x>-?\d+)[\s,]+(?P<y>-?\d+)$",
-     lambda d, m: d._mouse_move(m.group("x"), m.group("y"))),
-    (r"^(?:double\s*click|dbl\s*click)(?:\s+(?:at\s+)?(?P<x>-?\d+)[\s,]+(?P<y>-?\d+))?$",
-     lambda d, m: d._mouse_click("left", m.group("x"), m.group("y"), clicks=2)),
-    (r"^(?P<btn>left|right|middle)\s+click(?:\s+(?:at\s+)?(?P<x>-?\d+)[\s,]+(?P<y>-?\d+))?$",
-     lambda d, m: d._mouse_click(m.group("btn"), m.group("x"), m.group("y"))),
-    (r"^(?:mouse\s+)?click(?:\s+(?:at\s+)?(?P<x>-?\d+)[\s,]+(?P<y>-?\d+))?$",
-     lambda d, m: d._mouse_click("left", m.group("x"), m.group("y"))),
-    (r"^right\s+click(?:\s+(?:at\s+)?(?P<x>-?\d+)[\s,]+(?P<y>-?\d+))?$",
-     lambda d, m: d._mouse_click("right", m.group("x"), m.group("y"))),
-    (r"^scroll\s+(?P<dir>up|down)(?:\s+(?P<n>\d+))?$",
-     lambda d, m: d._mouse_scroll(m.group("dir"), int(m.group("n") or 3))),
-    (r"^drag\s+(?:from\s+)?(?P<x1>-?\d+)[\s,]+(?P<y1>-?\d+)"
-     r"\s+(?:to\s+)?(?P<x2>-?\d+)[\s,]+(?P<y2>-?\d+)$",
-     lambda d, m: d._mouse_drag(m.group("x1"), m.group("y1"),
-                                m.group("x2"), m.group("y2"))),
-
-    # ───── Project scaffold (Phase 2) ─────
-    # Canonical: `scaffold <stack> <name>` where stack is one of
-    # python / node / static / rust. Creates a sensible starting
-    # layout in the workspace, then runs git init.
-    (r"^scaffold\s+(?P<stack>python|node|static|rust)\s+(?P<name>.+)$",
-     lambda d, m: d._scaffold_project(m.group("stack"), m.group("name").strip())),
-
-    # ───── Shell exec (Phase 3) ─────
-    # Canonical: `run <cmd> [in <path>]`. Allow-listed tools only
-    # (git/python/npm/uv/cargo/node/gh/...). The LLM translates
-    # natural phrasings into this shape. Must come before the generic
-    # `open|launch|start|run <app>` catch-all so "run pytest" doesn't
-    # try to launch pytest.exe as an app.
-    (r"^(?:run|exec|execute)\s+(?P<cmd>.+)$",
-     lambda d, m: d._run_shell(m.group("cmd").strip())),
-
-    # App / file / folder / URL launcher — MUST come after the specific commands above.
-    (r"^(?:open|launch|start)\s+(?P<app>.+)$",
-     lambda d, m: d._open_app(m.group("app").strip())),
-
-    # Search
-    (r"^(?:google|search)\s+(?:for\s+)?(?P<q>.+)$",
-     lambda d, m: d._search_web(m.group("q").strip())),
-    (r"^look\s+up\s+(?P<q>.+)$",
-     lambda d, m: d._search_web(m.group("q").strip())),
-
-    # Spotify: one-time connection permission (no API keys needed).
-    # English + Spanish phrasings.
-    (r"^(?:connect(?:\s+to)?\s+spotify|setup\s+spotify|conect(?:a|ar)(?:\s+a)?\s+spotify|configura(?:r)?\s+spotify)$",
-     lambda d, m: d._connect_spotify()),
-
-    # Spotify search — `play <song>` and `spotify <song>`
-    (r"^(?:play|spotify)\s+(?P<q>.+)$",
-     lambda d, m: d._play_spotify(m.group("q").strip())),
+    (exact("connect to spotify", "connect spotify", "setup spotify",
+           "conecta a spotify", "conectar a spotify", "conecta spotify",
+           "configura spotify", "configurar spotify"),
+     lambda d, m: d._connect_spotify(), N),
+    (prefix("play", "spotify", rest="q"),
+     lambda d, m: d._play_spotify(m.group("q").strip()), N),
 ]

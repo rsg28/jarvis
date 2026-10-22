@@ -1,16 +1,13 @@
 """
-LLM fallback for Jarvis.
+LLM layer for Jarvis (Gemini by default; Ollama is the local backend).
 
-When the regex-based intent table doesn't recognise a request, the
-dispatcher hands the raw transcript to Gemini with a system prompt
-describing the available skills. Gemini returns JSON with one of:
+The dispatcher sends the transcript here first. The model returns JSON:
 
     {"action": "call_intent", "command": "<canonical string>"}
     {"action": "chat",        "reply":   "<conversational answer>"}
 
-`call_intent` results are re-dispatched through the same regex table,
-so LLM-driven commands share the exact same execution path as typed
-ones. `chat` responses are just spoken back.
+`call_intent` is re-dispatched through the phrase table so it shares
+the same execution path as a typed command.
 
 No new dependency: uses `requests` (already required by the news /
 soccer modules) and the free Gemini REST API. Get a key at
@@ -22,9 +19,10 @@ from __future__ import annotations
 import json
 import logging
 import os
-import re
 from collections import deque
 from typing import Deque, Dict, List, Optional, Tuple
+
+from matchers import first_json_object, rescue_json_reply, strip_fences
 
 
 SYSTEM_PROMPT = """You are the language layer for Jarvis, a personal desktop assistant.
@@ -140,6 +138,9 @@ Prefer these EXACT phrasings when you emit `call_intent`:
                                       -> "run pip install flask"
   find <name>                    List matching apps / files without opening.
   search <query>                 Google search
+  phone link | link del celular  Speak the address and PIN for the phone
+                                 page. Same Jarvis, commands run on this PC.
+                                 Phone and PC must be on the same Wi-Fi.
   connect to spotify             one-time permission flow — Jarvis finds the
                                  installed Spotify desktop app, launches it,
                                  verifies it starts, and remembers the
@@ -628,29 +629,16 @@ class LLM:
         # text to a chat reply. This is what the user expects from a
         # "talk to me naturally" assistant — if the model has something
         # intelligible to say, say it.
-        stripped = (text or "").strip()
+        stripped = strip_fences(text or "")
         if stripped:
-            # Strip any stray code fences so we don't speak backticks.
-            stripped = re.sub(r"^```[a-z]*\s*", "", stripped)
-            stripped = re.sub(r"\s*```\s*$", "", stripped)
-            # Truncated-JSON rescue: Gemini sometimes hits the token
-            # cap mid-reply, so we get something like
-            #   {"action": "chat", "reply": "In chapter 65, Sasaki and
-            # with no closing quote/brace. json.loads can't parse it,
-            # but we can still fish out the reply text. Same for a
-            # complete-but-slightly-malformed response.
+            # Truncated-JSON rescue: the model sometimes hits the token
+            # cap mid-reply. Pull the reply string out without regex.
             if stripped.lstrip().startswith("{") or '"reply"' in stripped:
-                m = re.search(r'"reply"\s*:\s*"((?:\\.|[^"\\])*)',
-                              stripped, re.DOTALL)
-                if m:
-                    rescued = (m.group(1)
-                               .replace('\\n', '\n')
-                               .replace('\\"', '"')
-                               .replace('\\\\', '\\')).strip()
-                    if rescued:
-                        logging.info("[llm] rescued reply from truncated "
-                                     "JSON: %s", rescued[:120])
-                        stripped = rescued
+                rescued = rescue_json_reply(stripped)
+                if rescued:
+                    logging.info("[llm] rescued reply from truncated "
+                                 "JSON: %s", rescued[:120])
+                    stripped = rescued
             # Keep it reasonable for TTS.
             if len(stripped) > 600:
                 stripped = stripped[:597].rsplit(" ", 1)[0] + "…"
@@ -680,20 +668,16 @@ class LLM:
         block just in case."""
         if not text:
             return None
-        stripped = text.strip()
-        # Strip ```json ... ``` fences if present.
-        stripped = re.sub(r"^```(?:json)?\s*", "", stripped)
-        stripped = re.sub(r"\s*```$", "", stripped)
+        stripped = strip_fences(text)
         try:
             return json.loads(stripped)
         except Exception:
             pass
-        # Last resort: find the first balanced { ... } block.
-        m = re.search(r"\{.*\}", stripped, re.DOTALL)
-        if not m:
+        blob = first_json_object(stripped)
+        if not blob:
             return None
         try:
-            return json.loads(m.group(0))
+            return json.loads(blob)
         except Exception:
             return None
 
