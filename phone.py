@@ -37,7 +37,7 @@ class PhoneState:
 
 STATE = PhoneState()
 
-_CALLBACK: dict = {"fn": None}
+_CALLBACK: dict = {"fn": None, "settings": None}
 
 
 def _lan_ips() -> list[str]:
@@ -110,6 +110,7 @@ PAGE = r"""<!DOCTYPE html>
   }
   header h1 { margin: 0; font-size: 15px; letter-spacing: 0.18em; font-weight: 650; }
   header p { margin: 0; color: var(--muted); font-size: 12px; }
+  header a { color: var(--accent); text-decoration: none; font-size: 13px; margin-left: 12px; }
   #log {
     flex: 1; overflow-y: auto; padding: 16px;
     display: flex; flex-direction: column; gap: 10px;
@@ -173,7 +174,7 @@ PAGE = r"""<!DOCTYPE html>
   </div>
   <header>
     <h1>JARVIS</h1>
-    <p id="status">en la PC</p>
+    <p id="status">en la PC <a href="/settings">ajustes</a></p>
   </header>
   <div id="log"></div>
   <div class="chips">
@@ -348,8 +349,27 @@ class _Handler(BaseHTTPRequestHandler):
         if path in ("/", "/index.html"):
             self._send(200, PAGE.encode("utf-8"), "text/html; charset=utf-8")
             return
+        if path in ("/settings", "/settings.html"):
+            from settings import PAGE as SETTINGS_PAGE
+            self._send(200, SETTINGS_PAGE.encode("utf-8"),
+                       "text/html; charset=utf-8")
+            return
         if path == "/api/health":
             self._json(200, {"ok": True})
+            return
+        if path == "/api/settings":
+            if not self._authed():
+                self._json(401, {"error": "pin requerido"})
+                return
+            ctrl = _CALLBACK.get("settings")
+            if ctrl is None:
+                self._json(503, {"error": "settings unavailable"})
+                return
+            try:
+                self._json(200, ctrl.snapshot())
+            except Exception as exc:
+                logging.exception("[phone] settings get")
+                self._json(500, {"error": type(exc).__name__})
             return
         self._json(404, {"error": "not found"})
 
@@ -397,13 +417,48 @@ class _Handler(BaseHTTPRequestHandler):
             self._json(200, {"reply": reply, "speak": spoken})
             return
 
+        if path == "/api/settings":
+            if not self._authed():
+                self._json(401, {"error": "pin requerido"})
+                return
+            ctrl = _CALLBACK.get("settings")
+            if ctrl is None:
+                self._json(503, {"error": "settings unavailable"})
+                return
+            data = self._read_json()
+            try:
+                self._json(200, ctrl.apply(data.get("values") or {}))
+            except Exception as exc:
+                logging.exception("[phone] settings save")
+                self._json(500, {"error": type(exc).__name__})
+            return
+
+        if path == "/api/vram":
+            if not self._authed():
+                self._json(401, {"error": "pin requerido"})
+                return
+            ctrl = _CALLBACK.get("settings")
+            if ctrl is None:
+                self._json(503, {"error": "settings unavailable"})
+                return
+            data = self._read_json()
+            try:
+                self._json(200, ctrl.vram_action(str(data.get("action") or "")))
+            except Exception as exc:
+                logging.exception("[phone] vram action")
+                self._json(500, {"error": str(exc)[:140]})
+            return
+
         self._json(404, {"error": "not found"})
 
 
-def start(config: dict, on_command: Callable[[str, bool], str]) -> PhoneState:
+def start(config: dict, on_command: Callable[[str, bool], str],
+          settings=None) -> PhoneState:
     """Bind the phone server. Returns immediately; serving happens
     on a daemon thread. Safe to call once per process."""
     if STATE.running:
+        _CALLBACK["fn"] = on_command
+        _CALLBACK["settings"] = settings
         return STATE
     phone_cfg = config.get("phone") or {}
     if not bool(phone_cfg.get("enabled", True)):
@@ -415,6 +470,7 @@ def start(config: dict, on_command: Callable[[str, bool], str]) -> PhoneState:
     port = int(phone_cfg.get("port", 8765))
 
     _CALLBACK["fn"] = on_command
+    _CALLBACK["settings"] = settings
     _Handler.pin = pin
     _Handler.sessions = set()
     _Handler.fails = {}

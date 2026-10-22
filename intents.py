@@ -454,6 +454,10 @@ exact_phone = exact(
     "phone link", "link del celular", "enlace del celular",
     "jarvis en el celular", "abrir en el celular",
 )
+exact_settings = exact(
+    "open settings", "settings", "ajustes", "configuracion",
+    "abre configuracion", "abre los ajustes", "open config",
+)
 exact_pause = exact("pause", "play", "resume", "toggle playback", "pausa", "reanuda")
 exact_next = exact("next", "next song", "next track", "skip", "siguiente")
 exact_prev = exact("previous", "previous song", "previous track", "back", "prev", "anterior")

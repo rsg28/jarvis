@@ -141,6 +141,9 @@ Prefer these EXACT phrasings when you emit `call_intent`:
   phone link | link del celular  Speak the address and PIN for the phone
                                  page. Same Jarvis, commands run on this PC.
                                  Phone and PC must be on the same Wi-Fi.
+  open settings | ajustes        Open the local settings page in the browser
+                                 (VRAM, voice, gaming, hotkey). Also
+                                 /settings on the phone server.
   connect to spotify             one-time permission flow — Jarvis finds the
                                  installed Spotify desktop app, launches it,
                                  verifies it starts, and remembers the

@@ -546,11 +546,23 @@ class CommandDispatcher:
             if name.startswith("_") or not isinstance(section, dict):
                 continue
             lines.append(f"[{name}]")
+            array_tables = []
             for k, v in section.items():
+                if isinstance(v, list) and v and isinstance(v[0], dict):
+                    array_tables.append((k, v))
+                    continue
                 if isinstance(v, dict):
                     continue  # nested tables not used by this app
                 lines.append(f"{k} = {_fmt(v)}")
             lines.append("")
+            for key, rows in array_tables:
+                for row in rows:
+                    lines.append(f"[[{name}.{key}]]")
+                    for rk, rv in row.items():
+                        if isinstance(rv, dict):
+                            continue
+                        lines.append(f"{rk} = {_fmt(rv)}")
+                    lines.append("")
         from pathlib import Path as _P
         _P(path).write_text("\n".join(lines).rstrip() + "\n",
                             encoding="utf-8")
@@ -1972,6 +1984,12 @@ class CommandDispatcher:
         freed_mb = sum(int(m.get("size_vram", 0)) for m in before) // (1024 * 1024)
         for name in names:
             unload(name, host=host)
+        llm = getattr(self, "_llm", None)
+        if llm is not None and hasattr(llm, "pause_keeper"):
+            try:
+                llm.pause_keeper()
+            except Exception:
+                pass
         return CommandResult(
             speak=f"Released about {freed_mb} megabytes of VRAM. "
                   f"{len(names)} model{'s' if len(names) != 1 else ''} unloaded.",
@@ -1990,7 +2008,16 @@ class CommandDispatcher:
         host  = llm_cfg.get("ollama_host",  "http://localhost:11434")
         model = llm_cfg.get("ollama_model", "qwen2.5:7b-instruct")
         keep  = llm_cfg.get("ollama_keep_alive", "5m")
-        ok = warmup(model, host=host, keep_alive=keep)
+        llm = getattr(self, "_llm", None)
+        if llm is not None and hasattr(llm, "resume_keeper"):
+            try:
+                llm.resume_keeper()
+            except Exception:
+                pass
+        if llm is not None and hasattr(llm, "prefetch"):
+            ok = llm.prefetch()
+        else:
+            ok = warmup(model, host=host, keep_alive=keep)
         if not ok:
             return CommandResult(
                 speak=f"I couldn't warm up {model}. Is Ollama running?",
@@ -2582,6 +2609,31 @@ class CommandDispatcher:
                                  else stderr[:4000] + "\n... (truncated)")
         return CommandResult(speak=spoken, print_out="\n".join(printed_lines))
 
+    def _open_settings(self, _match=None) -> CommandResult:
+        try:
+            import phone as phone_mod
+        except Exception as exc:
+            return CommandResult(
+                speak="Settings page isn't available.",
+                print_out=f"[settings] import failed: {exc}")
+        if not phone_mod.STATE.running:
+            return CommandResult(
+                speak="The phone server is off, so I can't open settings.",
+                print_out="[settings] server not running")
+        url = f"http://127.0.0.1:{phone_mod.STATE.port}/settings"
+        try:
+            webbrowser.open(url)
+        except Exception as exc:
+            return CommandResult(
+                speak="I couldn't open the browser.",
+                print_out=f"[settings] {exc}")
+        pin = phone_mod.STATE.pin
+        spoken_pin = ", ".join(pin) if pin else ""
+        return CommandResult(
+            speak=(f"Opened settings. The pin is {spoken_pin}."
+                   if pin else "Opened settings."),
+            print_out=f"[settings] {url}")
+
     def _phone_link(self, _match=None) -> CommandResult:
         """Speak the LAN address and PIN so the user can open Jarvis
         on their phone. The server itself is started at boot."""
@@ -2628,6 +2680,7 @@ INTENTS: list[tuple[Callable, Callable, bool]] = [
     (I.exact_stop, lambda d, m: d._stop_listening(m), C),
     (I.exact_help, lambda d, m: d._help(m), C),
     (I.exact_phone, lambda d, m: d._phone_link(m), C),
+    (I.exact_settings, lambda d, m: d._open_settings(m), C),
     (I.exact_quit, lambda d, m: d._quit(m), C),
 
     (exact("what time is it", "whats the time", "current time", "time"),

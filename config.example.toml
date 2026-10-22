@@ -100,6 +100,19 @@ temperature     = 0.3
 timeout_seconds = 6.0
 history_size    = 5                   # exchanges kept for context ("and tomorrow?")
 
+# Ollama (used when backend = "ollama"). Copy these under [llm] if you
+# switch off Gemini. Smaller num_ctx = less VRAM; keepalive ping keeps
+# the model warm while Jarvis is open without holding it after quit.
+# ollama_host           = "http://localhost:11434"
+# ollama_model          = "qwen2.5:7b-instruct"
+# ollama_embed_model    = "nomic-embed-text"
+# ollama_keep_alive     = "5m"
+# ollama_num_ctx        = 8192
+# ollama_num_predict    = 256
+# ollama_autostart      = true
+# ollama_warmup_on_boot = true
+# ollama_keepalive_ping = true
+
 [stt]
 # STT engine. Options:
 #   "whisper" — local faster-whisper (offline, best accuracy)

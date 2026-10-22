@@ -479,7 +479,9 @@ def _start_phone(config: dict, dispatcher: CommandDispatcher, voice: Voice) -> N
 
     try:
         import phone as phone_mod
-        info = phone_mod.start(config, _on_command)
+        from settings import SettingsController
+        ctrl = SettingsController(dispatcher, voice, config)
+        info = phone_mod.start(config, _on_command, settings=ctrl)
     except Exception as exc:
         logging.warning("[phone] failed to start: %s", exc)
         return
